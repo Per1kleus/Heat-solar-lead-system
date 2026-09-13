@@ -1,0 +1,23 @@
+{
+  "name": "voltaflow",
+  "private": true,
+  "version": "1.0.0",
+  "description": "VoltaFlow — Lead & sales platform for solar PV and heat-pump installers",
+  "workspaces": ["server", "web"],
+  "engines": { "node": ">=22.5.0" },
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "npm -w server run dev",
+    "dev:web": "npm -w web run dev",
+    "build": "npm -w web run build && npm -w server run build",
+    "start": "npm -w server run start",
+    "db:migrate": "npm -w server run db:migrate",
+    "db:seed": "npm -w server run db:seed",
+    "db:reset": "npm -w server run db:reset",
+    "test": "npm -w server run test",
+    "typecheck": "npm -w server run typecheck && npm -w web run typecheck"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
