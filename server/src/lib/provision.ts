@@ -1,10 +1,10 @@
-import { get, insert, run } from './db.ts';
+import { all, get, insert, run } from './db.ts';
 import { newId, randomToken, slugify } from './ids.ts';
 import { addDays, nowIso } from './time.ts';
 import { hashPassword } from './auth.ts';
 import {
   DEFAULT_AUTOMATION_RULES, DEFAULT_LOST_REASONS, DEFAULT_PRODUCTS, DEFAULT_SCORING_RULES,
-  DEFAULT_SOURCES, DEFAULT_STAGES, DEFAULT_TEMPLATES, PLANS, type PlanKey,
+  DEFAULT_SOURCES, DEFAULT_STAGES, DEFAULT_TEMPLATES, OPTIONAL_AUTOMATION_RULES, PLANS, type PlanKey,
 } from './defaults.ts';
 import { audit } from './audit.ts';
 import { conflict } from './errors.ts';
@@ -111,23 +111,7 @@ export function seedOrganizationDefaults(orgId: string, userId: string | null): 
     position: 0, conditions: '[]', strategy: 'round_robin', created_at: now,
   });
 
-  DEFAULT_TEMPLATES.forEach((template) => {
-    insert('message_templates', {
-      id: newId('tpl'), org_id: orgId, key: template.key, name: template.name,
-      channel: template.channel, purpose: template.purpose, subject: template.subject,
-      body: template.body, created_at: now, updated_at: now,
-    });
-  });
-
-  DEFAULT_AUTOMATION_RULES.forEach((rule) => {
-    insert('automation_rules', {
-      id: newId('aut'), org_id: orgId, key: rule.key, name: rule.name,
-      description: rule.description, trigger_type: rule.trigger_type,
-      trigger_config: JSON.stringify((rule as any).trigger_config ?? {}),
-      conditions: '[]', steps: JSON.stringify(rule.steps), stop_on: JSON.stringify(rule.stop_on),
-      is_active: 1, is_system: 1, created_by: userId, created_at: now, updated_at: now,
-    });
-  });
+  syncOrgDefaults(orgId, userId);
 
   DEFAULT_PRODUCTS.forEach((product) => {
     insert('product_templates', {
@@ -181,4 +165,59 @@ export const DEFAULT_QUOTE_TERMS = `1. This quotation is valid until the date sh
 export function nextAvatarColor(orgId: string): string {
   const count = get<{ n: number }>('SELECT COUNT(*) AS n FROM users WHERE org_id = ?', [orgId])?.n ?? 0;
   return AVATAR_COLORS[count % AVATAR_COLORS.length];
+}
+
+/**
+ * Creates any default template or automation rule the organisation does not have
+ * yet. Called when a company signs up, and once on boot for every existing
+ * company, so a new default that ships in an upgrade reaches them too. Existing
+ * rows are never touched — an installer who reworded a template or switched a
+ * rule off keeps their version.
+ */
+export function syncOrgDefaults(orgId: string, userId: string | null = null): { templates: number; rules: number } {
+  const now = nowIso();
+  let templates = 0;
+  let rules = 0;
+
+  for (const template of DEFAULT_TEMPLATES) {
+    if (get('SELECT 1 FROM message_templates WHERE org_id = ? AND key = ?', [orgId, template.key])) continue;
+    insert('message_templates', {
+      id: newId('tpl'), org_id: orgId, key: template.key, name: template.name,
+      channel: template.channel, purpose: template.purpose, subject: template.subject,
+      body: template.body, created_at: now, updated_at: now,
+    });
+    templates += 1;
+  }
+
+  const creator = userId ?? get<{ id: string }>(
+    "SELECT id FROM users WHERE org_id = ? AND role IN ('owner','admin') ORDER BY created_at LIMIT 1", [orgId],
+  )?.id ?? null;
+
+  const seed = (rule: any, active: boolean) => {
+    if (get('SELECT 1 FROM automation_rules WHERE org_id = ? AND key = ?', [orgId, rule.key])) return;
+    insert('automation_rules', {
+      id: newId('aut'), org_id: orgId, key: rule.key, name: rule.name,
+      description: rule.description, trigger_type: rule.trigger_type,
+      trigger_config: JSON.stringify(rule.trigger_config ?? {}),
+      conditions: '[]', steps: JSON.stringify(rule.steps), stop_on: JSON.stringify(rule.stop_on),
+      is_active: active ? 1 : 0, is_system: 1, created_by: creator, created_at: now, updated_at: now,
+    });
+    rules += 1;
+  };
+  DEFAULT_AUTOMATION_RULES.forEach((rule) => seed(rule, true));
+  // Customer-facing sequences arrive switched off — see OPTIONAL_AUTOMATION_RULES.
+  OPTIONAL_AUTOMATION_RULES.forEach((rule) => seed(rule, false));
+
+  return { templates, rules };
+}
+
+/** Brings every organisation up to the current defaults. Runs once at startup. */
+export function syncAllOrgDefaults(): void {
+  for (const org of all<{ id: string }>('SELECT id FROM organizations')) {
+    try {
+      syncOrgDefaults(org.id);
+    } catch (err) {
+      console.error('[provision] could not sync defaults for', org.id, err);
+    }
+  }
 }

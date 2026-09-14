@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { all, get, insert } from '../lib/db.ts';
 import { ah } from '../middleware/errors.ts';
 import { requirePermission } from '../middleware/context.ts';
-import { getIntegration, sendMessage } from '../lib/messaging.ts';
+import { channelStatus, getIntegration, renderTemplate, resolveChannel, sendMessage } from '../lib/messaging.ts';
 import { loadLead, logActivity, rescoreLead } from '../lib/leads.ts';
 import { assertVisible } from './leads.ts';
 import { badRequest } from '../lib/errors.ts';
@@ -12,40 +12,116 @@ import { nowIso } from '../lib/time.ts';
 
 export const messagesRouter = Router();
 
-/** Which channels this organisation can actually use right now. */
+/**
+ * Which channels this organisation can actually use right now, and — when a lead
+ * is named — which one the customer should be contacted on and whether they are
+ * reachable there at all. The setup path is part of the answer so the UI never
+ * has to invent one.
+ */
 messagesRouter.get('/channels', ah((req, res) => {
-  const smtp = getIntegration(req.ctx.orgId, 'smtp');
-  const whatsapp = getIntegration(req.ctx.orgId, 'whatsapp_cloud');
-  const telephony = getIntegration(req.ctx.orgId, 'telephony');
+  const { orgId } = req.ctx;
+  const smtp = getIntegration(orgId, 'smtp');
+  const whatsapp = getIntegration(orgId, 'whatsapp_cloud');
+  const telephony = getIntegration(orgId, 'telephony');
+  const status = channelStatus(orgId);
+
+  const leadId = (req.query.lead_id as string | undefined) ?? null;
+  let lead: any = null;
+  if (leadId) {
+    lead = get<any>(
+      'SELECT id, owner_id, first_name, last_name, phone, email, preferred_contact, messaging_opt_out FROM leads WHERE id = ? AND org_id = ? AND deleted_at IS NULL',
+      [leadId, orgId],
+    );
+    if (lead && !req.ctx.seesAll() && lead.owner_id !== req.ctx.user.id) lead = null;
+  }
+  const reachableOn = (key: string): boolean => {
+    if (!lead) return true;
+    return key === 'email' ? Boolean(lead.email) : Boolean(lead.phone);
+  };
+
+  const channels = [
+    {
+      key: 'email', label: 'Email',
+      connected: status.email.connected,
+      status: smtp?.status ?? 'disconnected',
+      error: smtp?.last_error ?? null,
+      hint: status.email.reason,
+      setup_path: '/app/settings/integrations',
+      reachable: reachableOn('email'),
+      address: lead?.email ?? null,
+    },
+    {
+      key: 'whatsapp', label: 'WhatsApp',
+      connected: status.whatsapp.connected,
+      status: whatsapp?.status ?? 'disconnected',
+      error: whatsapp?.last_error ?? null,
+      hint: status.whatsapp.reason,
+      setup_path: '/app/settings/integrations',
+      reachable: reachableOn('whatsapp'),
+      address: lead?.phone ?? null,
+    },
+    {
+      key: 'phone', label: 'Phone',
+      // Click-to-call always works through the device; the integration only adds
+      // automatic call logging.
+      connected: true,
+      status: telephony?.status ?? 'disconnected',
+      error: null,
+      hint: status.phone.reason,
+      setup_path: '/app/settings/integrations',
+      reachable: reachableOn('phone'),
+      address: lead?.phone ?? null,
+    },
+    {
+      key: 'sms', label: 'SMS',
+      // No SMS provider is implemented. Saying "not available" is the honest
+      // answer; a disabled button that pretends otherwise would not be.
+      connected: false,
+      status: 'unavailable',
+      error: null,
+      hint: status.sms.reason,
+      setup_path: null,
+      reachable: reachableOn('sms'),
+      address: lead?.phone ?? null,
+    },
+  ];
+
+  const preferred = lead ? resolveChannel(orgId, lead, 'preferred') : null;
   res.json({
-    channels: [
-      {
-        key: 'email', label: 'Email',
-        connected: smtp?.status === 'connected',
-        status: smtp?.status ?? 'disconnected',
-        error: smtp?.last_error ?? null,
-        hint: 'Connect your mailbox in Settings → Communication to send email from VoltaFlow.',
-      },
-      {
-        key: 'whatsapp', label: 'WhatsApp',
-        connected: whatsapp?.status === 'connected',
-        status: whatsapp?.status ?? 'disconnected',
-        error: whatsapp?.last_error ?? null,
-        hint: 'WhatsApp is not connected. Connect WhatsApp Business in Settings → Communication to enable this feature.',
-      },
-      {
-        key: 'phone', label: 'Phone',
-        // Click-to-call always works through the device; the integration only adds
-        // automatic call logging.
-        connected: true,
-        status: telephony?.status ?? 'disconnected',
-        error: null,
-        hint: telephony?.status === 'connected'
-          ? 'Calls are logged automatically by your telephony provider.'
-          : 'Calls open on your device and are logged manually. Connect a telephony provider for automatic logging.',
-      },
-    ],
+    channels,
+    preferred: preferred?.channel ?? null,
+    preferred_reason: preferred?.reason || null,
+    stated_preference: lead?.preferred_contact ?? null,
+    opted_out: lead ? Boolean(lead.messaging_opt_out) : false,
   });
+}));
+
+/**
+ * The message templates, already rendered against this lead. The composer shows
+ * the result and the sender edits it before sending — rendering server-side keeps
+ * company data and template logic off the client.
+ */
+messagesRouter.get('/templates', requirePermission('messages:send'), ah((req, res) => {
+  const q = z.object({
+    lead_id: z.string(),
+    quotation_id: z.string().optional(),
+    appointment_id: z.string().optional(),
+  }).parse(req.query);
+  const lead = loadLead(req.ctx.orgId, q.lead_id);
+  assertVisible(req, lead);
+
+  const keys = all<{ key: string }>(
+    'SELECT key FROM message_templates WHERE org_id = ? AND is_active = 1 ORDER BY name', [req.ctx.orgId],
+  );
+  const templates = keys
+    .map((row) => renderTemplate(req.ctx.orgId, row.key, {
+      leadId: lead.id,
+      quotationId: q.quotation_id ?? null,
+      appointmentId: q.appointment_id ?? null,
+      userId: req.ctx.user.id,
+    }))
+    .filter(Boolean);
+  res.json({ templates });
 }));
 
 messagesRouter.get('/', requirePermission('messages:read'), ah((req, res) => {

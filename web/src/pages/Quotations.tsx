@@ -149,7 +149,13 @@ export default function Quotations() {
       {builderFor !== null && (
         <QuotationBuilder
           leadId={builderFor || undefined}
-          onClose={() => { setBuilderFor(null); const next = new URLSearchParams(params); next.delete('new'); next.delete('lead_id'); setParams(next, { replace: true }); }}
+          surveyId={params.get('survey_id') ?? undefined}
+          onClose={() => {
+            setBuilderFor(null);
+            const next = new URLSearchParams(params);
+            next.delete('new'); next.delete('lead_id'); next.delete('survey_id');
+            setParams(next, { replace: true });
+          }}
           onSaved={(quote) => { setBuilderFor(null); navigate(`/app/quotations/${quote.id}`); }}
         />
       )}

@@ -9,7 +9,7 @@ import {
 import { createTask } from './tasks.ts';
 import { notify, notifyManagers, type NotificationType } from './notify.ts';
 import { render } from './render.ts';
-import { sendTemplate } from './messaging.ts';
+import { resolveChannel, sendTemplate, type Channel } from './messaging.ts';
 
 export interface AutomationStep {
   delay_minutes: number;
@@ -66,6 +66,21 @@ function handleEvent(event: DomainEvent): void {
       break;
     case 'appointment_booked':
       if (event.leadId) stopRuns(event.orgId, event.leadId, 'appointment_booked');
+      startRules(event.orgId, 'appointment_scheduled', {
+        leadId: event.leadId, appointmentId: event.appointmentId,
+      });
+      break;
+    case 'appointment_reminder_due':
+      startRules(event.orgId, 'appointment_reminder_due', {
+        leadId: event.leadId, appointmentId: event.appointmentId,
+      });
+      break;
+    case 'appointment_cancelled':
+      // Any reminder still queued for this appointment must not go out.
+      stopAppointmentRuns(event.orgId, event.appointmentId, 'appointment_cancelled');
+      break;
+    case 'installation_completed':
+      startRules(event.orgId, 'installation_completed', { leadId: event.leadId });
       break;
     case 'quote_responded':
       if (event.leadId) stopRuns(event.orgId, event.leadId, 'quote_responded', event.quotationId);
@@ -91,7 +106,7 @@ function handleEvent(event: DomainEvent): void {
 function startRules(
   orgId: string,
   triggerType: string,
-  target: { leadId: string | null; quotationId?: string; taskId?: string },
+  target: { leadId: string | null; quotationId?: string; taskId?: string; appointmentId?: string },
   configFilter?: (config: Record<string, any>) => boolean,
 ): void {
   const rules = all<RuleRow>(
@@ -112,6 +127,7 @@ function startRules(
     const runId = newId('run');
     const context = {
       lead_id: target.leadId, quotation_id: target.quotationId ?? null, task_id: target.taskId ?? null,
+      appointment_id: target.appointmentId ?? null,
     };
     try {
       insert('automation_runs', {
@@ -120,6 +136,10 @@ function startRules(
         rule_id: rule.id,
         lead_id: target.leadId,
         quotation_id: target.quotationId ?? null,
+        appointment_id: target.appointmentId ?? null,
+        // One run per rule per target. The flattened key is what actually
+        // deduplicates: a UNIQUE constraint over nullable columns would not.
+        run_key: [rule.id, target.leadId ?? '-', target.quotationId ?? '-', target.appointmentId ?? '-'].join(':'),
         status: 'active',
         step_index: 0,
         next_run_at: nowIso(),
@@ -245,6 +265,7 @@ interface ActionContext {
   lead: any | null;
   quotation: any | null;
   task: any | null;
+  appointment: any | null;
   org: any;
 }
 
@@ -260,7 +281,11 @@ function buildContext(runRow: any): ActionContext | null {
   const task = ctx.task_id
     ? get<any>('SELECT * FROM tasks WHERE id = ? AND org_id = ?', [ctx.task_id, runRow.org_id]) ?? null
     : null;
-  return { orgId: runRow.org_id, lead, quotation, task, org };
+  const appointmentId = runRow.appointment_id ?? ctx.appointment_id ?? null;
+  const appointment = appointmentId
+    ? get<any>('SELECT * FROM appointments WHERE id = ? AND org_id = ?', [appointmentId, runRow.org_id]) ?? null
+    : null;
+  return { orgId: runRow.org_id, lead, quotation, task, appointment, org };
 }
 
 /** Conditions that cut a sequence short. */
@@ -297,6 +322,12 @@ function shouldStop(conditions: string[], ctx: ActionContext): boolean {
       }
       case 'paused':
         if (ctx.lead?.automation_paused) return true;
+        break;
+      case 'opted_out':
+        if (ctx.lead?.messaging_opt_out) return true;
+        break;
+      case 'appointment_cancelled':
+        if (ctx.appointment && ctx.appointment.status !== 'scheduled') return true;
         break;
       default:
         break;
@@ -372,14 +403,28 @@ function runAction(action: AutomationAction, ctx: ActionContext, rule: RuleRow, 
     }
     case 'send_template': {
       if (!ctx.lead) return 'send_template: skipped (no lead)';
+      if (ctx.lead.messaging_opt_out) {
+        return `template "${action.template_key}" not sent: the contact has opted out of automatic messages`;
+      }
+      const requested = (action.channel ?? 'preferred') as Channel | 'preferred';
+      // Resolve up front so the log line names the channel that was actually
+      // used, and so an unreachable contact is reported now rather than silently.
+      const resolved = resolveChannel(ctx.orgId, ctx.lead, requested);
+      if (!resolved.channel) {
+        // Nowhere to send: no address on file, so there is not even an attempt
+        // to record.
+        return `template "${action.template_key}" not sent: ${resolved.reason}`;
+      }
+      const channel = resolved.channel;
       // Delivery is asynchronous; the real outcome is appended to this run's log
       // when the provider answers, so the log never claims an unconfirmed send.
       void sendTemplate({
         orgId: ctx.orgId,
         templateKey: action.template_key,
-        channel: action.channel ?? 'email',
+        channel,
         leadId: ctx.lead.id,
         quotationId: ctx.quotation?.id ?? null,
+        appointmentId: ctx.appointment?.id ?? null,
         userId: null,
         automationRunId: runRow.id,
         purpose: action.purpose ?? 'operational',
@@ -387,13 +432,13 @@ function runAction(action: AutomationAction, ctx: ActionContext, rule: RuleRow, 
         appendRunLog(
           runRow.id,
           result.sent
-            ? `sent ${action.channel ?? 'email'} template "${action.template_key}"`
+            ? `sent ${channel} template "${action.template_key}"`
             : `template "${action.template_key}" not sent: ${result.reason}`,
         );
       }).catch((err) => {
         appendRunLog(runRow.id, `template "${action.template_key}" failed: ${err?.message ?? err}`);
       });
-      return `queued ${action.channel ?? 'email'} template "${action.template_key}"`;
+      return `queued ${channel} template "${action.template_key}"`;
     }
     case 'change_stage': {
       if (!ctx.lead) return 'change_stage: skipped';
@@ -475,6 +520,40 @@ export function stopRuns(
     stopped += 1;
   }
   return stopped;
+}
+
+/** Ends any sequence attached to one appointment — used when it is cancelled. */
+export function stopAppointmentRuns(orgId: string, appointmentId: string, reason: string): number {
+  const runs = all<{ id: string }>(
+    "SELECT id FROM automation_runs WHERE org_id = ? AND appointment_id = ? AND status = 'active'",
+    [orgId, appointmentId],
+  );
+  for (const r of runs) finishRun(r.id, 'stopped', reason);
+  return runs.length;
+}
+
+/**
+ * Ends every active sequence for a lead regardless of the rule's stop_on list.
+ * Used when a person stops a sequence by hand and when a contact opts out — both
+ * of which must win over whatever the rule was configured to ignore.
+ */
+export function stopAllRuns(orgId: string, leadId: string, reason: string): number {
+  const runs = all<{ id: string }>(
+    "SELECT id FROM automation_runs WHERE org_id = ? AND lead_id = ? AND status = 'active'",
+    [orgId, leadId],
+  );
+  for (const r of runs) finishRun(r.id, 'stopped', reason);
+  return runs.length;
+}
+
+/** Ends a single sequence. Returns false when it was not active. */
+export function stopRun(orgId: string, runId: string, reason: string): boolean {
+  const row = get<{ id: string; status: string }>(
+    'SELECT id, status FROM automation_runs WHERE id = ? AND org_id = ?', [runId, orgId],
+  );
+  if (!row || row.status !== 'active') return false;
+  finishRun(row.id, 'stopped', reason);
+  return true;
 }
 
 function markContacted(orgId: string, leadId: string): void {

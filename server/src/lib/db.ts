@@ -24,6 +24,12 @@ export function applySchema(): void {
  */
 const ADDED_COLUMNS: { table: string; column: string; definition: string }[] = [
   { table: 'leads', column: 'requested_quote', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'leads', column: 'messaging_opt_out', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'quotations', column: 'survey_id', definition: 'TEXT' },
+  { table: 'appointments', column: 'confirmation_sent_at', definition: 'TEXT' },
+  { table: 'appointments', column: 'reminder_sent_at', definition: 'TEXT' },
+  { table: 'automation_runs', column: 'appointment_id', definition: 'TEXT' },
+  { table: 'automation_runs', column: 'run_key', definition: 'TEXT' },
 ];
 
 function addMissingColumns(): void {

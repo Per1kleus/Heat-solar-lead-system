@@ -13,6 +13,7 @@ import { badRequest, forbidden, notFound } from '../lib/errors.ts';
 import { logActivity, rescoreLead } from '../lib/leads.ts';
 import { audit } from '../lib/audit.ts';
 import { notify } from '../lib/notify.ts';
+import { buildQuotationDraft } from '../lib/quoteDraft.ts';
 
 export const surveysRouter = Router();
 
@@ -154,6 +155,28 @@ surveysRouter.patch('/:id', requirePermission('surveys:write'), ah((req, res) =>
     });
   }
   res.json({ survey: shapeSurvey(loadSurvey(req.ctx.orgId, survey.id)) });
+}));
+
+/**
+ * The pre-filled quotation for a completed survey. Nothing is written: the owner
+ * reviews and edits this in the builder, then creates the quotation themselves.
+ */
+surveysRouter.get('/:id/quotation-draft', requirePermission('quotes:write'), ah((req, res) => {
+  const survey = loadSurvey(req.ctx.orgId, req.params.id);
+  assertSurveyAccess(req, survey);
+  const draft = buildQuotationDraft(req.ctx.orgId, survey.id);
+  res.json({
+    draft,
+    // Earlier quotations for this lead: a second one is allowed, so say so rather
+    // than silently returning the first.
+    existing: survey.lead_id
+      ? all(
+          `SELECT id, number, status, total, currency, created_at, survey_id FROM quotations
+           WHERE org_id = ? AND lead_id = ? ORDER BY created_at DESC LIMIT 5`,
+          [req.ctx.orgId, survey.lead_id],
+        )
+      : [],
+  });
 }));
 
 function loadSurvey(orgId: string, id: string): any {

@@ -8,6 +8,7 @@ import { nowIso } from '../lib/time.ts';
 import { notFound, badRequest } from '../lib/errors.ts';
 import { audit } from '../lib/audit.ts';
 import { logActivity } from '../lib/leads.ts';
+import { emit } from '../lib/events.ts';
 
 export const customersRouter = Router();
 
@@ -247,6 +248,22 @@ projectsRouter.patch('/:id', requirePermission('projects:write'), ah((req, res) 
     );
   }
   recalcLifetimeValue(req.ctx.orgId, project.customer_id);
+  // Handing a job over is what starts the after-installation follow-up.
+  const handedOver = body.installation_status === 'handed_over'
+    && project.installation_status !== 'handed_over';
+  if (handedOver) {
+    if (project.lead_id) {
+      logActivity({
+        orgId: req.ctx.orgId, leadId: project.lead_id, type: 'system',
+        title: `Installation handed over: ${project.name}`, userId: req.ctx.user.id,
+        meta: { project_id: project.id },
+      });
+    }
+    emit({
+      type: 'installation_completed',
+      orgId: req.ctx.orgId, leadId: project.lead_id ?? null, projectId: project.id,
+    });
+  }
   audit({
     orgId: req.ctx.orgId, userId: req.ctx.user.id, action: 'project.updated', entityType: 'project',
     entityId: project.id, entityLabel: project.name, changes: body as Record<string, unknown>,

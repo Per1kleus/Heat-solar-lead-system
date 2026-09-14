@@ -15,6 +15,10 @@ export type DomainEvent =
   | { type: 'quote_sent'; orgId: string; leadId: string | null; quotationId: string; userId?: string | null }
   | { type: 'quote_responded'; orgId: string; leadId: string | null; quotationId: string; status: string }
   | { type: 'appointment_booked'; orgId: string; leadId: string | null; appointmentId: string }
+  | { type: 'appointment_reminder_due'; orgId: string; leadId: string | null; appointmentId: string }
+  | { type: 'appointment_cancelled'; orgId: string; leadId: string | null; appointmentId: string }
+  | { type: 'appointment_missed'; orgId: string; leadId: string | null; appointmentId: string }
+  | { type: 'installation_completed'; orgId: string; leadId: string | null; projectId: string }
   | { type: 'task_overdue'; orgId: string; taskId: string; leadId: string | null }
   | { type: 'lead_idle'; orgId: string; leadId: string }
   | { type: 'no_next_action'; orgId: string; leadId: string };

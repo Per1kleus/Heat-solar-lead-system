@@ -85,6 +85,8 @@ export interface CreateQuotationInput {
   leadId?: string | null;
   customerId?: string | null;
   projectId?: string | null;
+  /** The survey this was built from, when it came out of one. */
+  surveyId?: string | null;
   title: string;
   description?: string | null;
   items: QuotationItemInput[];
@@ -121,6 +123,7 @@ export function createQuotation(input: CreateQuotationInput): any {
     lead_id: input.leadId ?? null,
     customer_id: input.customerId ?? lead?.customer_id ?? null,
     project_id: input.projectId ?? null,
+    survey_id: input.surveyId ?? null,
     title: input.title.trim(),
     description: input.description ?? null,
     status: 'draft',

@@ -8,6 +8,9 @@ import {
   Modal, ScoreRing, Tabs, TemperatureBadge, useToast, type IconName,
 } from '../components/ui';
 import LeadForm from '../components/LeadForm';
+import MessageComposer from '../components/MessageComposer';
+import CommunicationPanel from '../components/CommunicationPanel';
+import AppointmentOutcome from '../components/AppointmentOutcome';
 import {
   money, dateTime, relative, isOverdue, projectTypeLabel, label, date, toInputDateTime,
   fromInputDateTime, PRIORITY_META,
@@ -45,7 +48,10 @@ export default function LeadDetail() {
   if (leadQuery.isLoading) return <div className="page"><LoadingBlock rows={4} height={90} /></div>;
   if (leadQuery.error) return <div className="page"><ErrorBlock error={leadQuery.error} onRetry={leadQuery.refetch} /></div>;
 
-  const { lead, completeness, quotations, tasks, appointments, surveys, documents, automation_runs: runs } = leadQuery.data;
+  const {
+    lead, completeness, quotations, tasks, appointments, surveys, documents,
+    automation_runs: runs, messages = [], last_contact: lastContact = null,
+  } = leadQuery.data;
   const openTasks = tasks.filter((t: any) => t.status === 'open');
   const nextTask = openTasks[0];
 
@@ -167,7 +173,7 @@ export default function LeadDetail() {
         ) : null}
       </div>
 
-      <div className="grid mt-4" style={{ gridTemplateColumns: 'minmax(0, 1.55fr) minmax(0, 1fr)', alignItems: 'start', gap: 16 }}>
+      <div className="grid split mt-4">
         {/* ---------- main column ---------- */}
         <div className="col gap-6">
           <Card padded={false}>
@@ -188,7 +194,7 @@ export default function LeadDetail() {
               {tab === 'timeline' && <Timeline query={activityQuery} onAdd={() => setDialog('note')} />}
               {tab === 'tasks' && <TaskList tasks={tasks} onRefresh={refresh} onAdd={() => setDialog('task')} />}
               {tab === 'quotes' && <QuoteList quotations={quotations} currency={currency} leadId={lead.id} />}
-              {tab === 'surveys' && <SurveyList surveys={surveys} appointments={appointments} onAdd={() => setDialog('appointment')} />}
+              {tab === 'surveys' && <SurveyList surveys={surveys} appointments={appointments} leadId={lead.id} onAdd={() => setDialog('appointment')} onRefresh={refresh} />}
               {tab === 'files' && <FileList documents={documents} onAdd={() => setDialog('upload')} />}
               {tab === 'automation' && <AutomationList runs={runs} lead={lead} onRefresh={refresh} />}
             </div>
@@ -197,6 +203,13 @@ export default function LeadDetail() {
 
         {/* ---------- side column ---------- */}
         <div className="col gap-6">
+          <CommunicationPanel
+            lead={lead}
+            messages={messages}
+            lastContact={lastContact}
+            onCall={() => setDialog('call')}
+            onRefresh={refresh}
+          />
           <ProjectSummary lead={lead} completeness={completeness} />
           <ScoreCard lead={lead} onRescore={async () => { await post(`/leads/${id}/rescore`); refresh(); }} />
           {(aiAvailable || hasFeature('ai')) && <AiPanel leadId={lead.id} available={aiAvailable} />}
@@ -214,8 +227,8 @@ export default function LeadDetail() {
       )}
       {dialog === 'note' && <ActivityDialog leadId={id} type="note" onClose={() => setDialog(null)} onSaved={refresh} />}
       {dialog === 'call' && <CallDialog lead={lead} onClose={() => setDialog(null)} onSaved={refresh} />}
-      {dialog === 'email' && <MessageDialog lead={lead} channel="email" onClose={() => setDialog(null)} onSaved={refresh} />}
-      {dialog === 'whatsapp' && <MessageDialog lead={lead} channel="whatsapp" onClose={() => setDialog(null)} onSaved={refresh} />}
+      {dialog === 'email' && <MessageComposer lead={lead} channel="email" onClose={() => setDialog(null)} onSent={refresh} />}
+      {dialog === 'whatsapp' && <MessageComposer lead={lead} channel="whatsapp" onClose={() => setDialog(null)} onSent={refresh} />}
       {dialog === 'task' && <TaskDialog leadId={id} defaultAssignee={lead.owner_id ?? user?.id} onClose={() => setDialog(null)} onSaved={refresh} />}
       {dialog === 'appointment' && <AppointmentDialog lead={lead} onClose={() => setDialog(null)} onSaved={refresh} />}
       {dialog === 'upload' && <UploadDialog leadId={id} onClose={() => setDialog(null)} onSaved={refresh} />}
@@ -588,8 +601,14 @@ export function quoteTone(status: string): string {
   return '';
 }
 
-function SurveyList({ surveys, appointments, onAdd }: { surveys: any[]; appointments: any[]; onAdd: () => void }) {
+function SurveyList({
+  surveys, appointments, leadId, onAdd, onRefresh,
+}: {
+  surveys: any[]; appointments: any[]; leadId: string; onAdd: () => void; onRefresh: () => void;
+}) {
   const navigate = useNavigate();
+  const { can } = useSession();
+  const [closing, setClosing] = useState<any | null>(null);
   if (surveys.length === 0 && appointments.length === 0) {
     return <EmptyState icon="survey" title="No site visit booked" message="A technical survey is the fastest way to turn an enquiry into an accurate quotation." action={<Button size="sm" variant="primary" onClick={onAdd}>Book a site survey</Button>} />;
   }
@@ -597,11 +616,14 @@ function SurveyList({ surveys, appointments, onAdd }: { surveys: any[]; appointm
     <div className="col gap-6">
       <div className="row end"><Button size="sm" icon="plus" onClick={onAdd}>Book a visit</Button></div>
       {surveys.map((survey) => (
-        <button
-          key={survey.id} className="card" style={{ padding: 12, textAlign: 'left', cursor: 'pointer', font: 'inherit', color: 'inherit' }}
-          onClick={() => navigate(`/app/surveys/${survey.id}`)}
-        >
-          <div className="row between wrap gap-4">
+        // A card, not a button: it carries its own actions, and a button inside a
+        // button is invalid HTML.
+        <div key={survey.id} className="card" style={{ padding: 12 }}>
+          <button
+            className="row between wrap gap-4"
+            style={{ width: '100%', textAlign: 'left', border: 0, background: 'none', font: 'inherit', color: 'inherit', cursor: 'pointer', padding: 0 }}
+            onClick={() => navigate(`/app/surveys/${survey.id}`)}
+          >
             <div>
               <div className="strong">Site survey — {label(survey.project_type)}</div>
               <div className="tiny dim">
@@ -610,23 +632,58 @@ function SurveyList({ surveys, appointments, onAdd }: { surveys: any[]; appointm
               </div>
             </div>
             <Badge tone={survey.status === 'completed' ? 'good' : survey.status === 'cancelled' ? 'danger' : 'cold'}>{label(survey.status)}</Badge>
-          </div>
+          </button>
           {survey.recommended_system && <div className="small mt-2"><strong>Recommended:</strong> {survey.recommended_system}</div>}
           {survey.technical_notes && <div className="small muted mt-2" style={{ whiteSpace: 'pre-wrap' }}>{survey.technical_notes}</div>}
           {survey.blockers && <div className="banner warn mt-2"><Icon name="alert" size={14} /><span>{survey.blockers}</span></div>}
-        </button>
+          {survey.status === 'completed' && can('quotes:write') && (
+            <div className="row gap-4 mt-4 wrap">
+              <Button
+                size="sm" variant="primary" icon="quote"
+                onClick={() => navigate(`/app/quotations?new=1&lead_id=${leadId}&survey_id=${survey.id}`)}
+              >
+                Create quotation
+              </Button>
+              <span className="tiny dim">Pre-filled from this survey — you review it before saving.</span>
+            </div>
+          )}
+        </div>
       ))}
       {appointments.filter((a) => !surveys.some((s) => s.appointment_id === a.id)).map((appt) => (
         <div key={appt.id} className="card" style={{ padding: 12 }}>
           <div className="row between wrap gap-4">
-            <div>
+            <div style={{ minWidth: 0 }}>
               <div className="strong">{appt.title}</div>
-              <div className="tiny dim">{dateTime(appt.starts_at)}{appt.location ? ` · ${appt.location}` : ''}</div>
+              <div className="tiny dim">
+                {dateTime(appt.starts_at)}{appt.location ? ` · ${appt.location}` : ''}
+                {appt.tech_first_name ? ` · ${appt.tech_first_name} ${appt.tech_last_name}` : ''}
+              </div>
+              {appt.outcome_note && <div className="small muted mt-2">{appt.outcome_note}</div>}
             </div>
-            <Badge tone={appt.status === 'completed' ? 'good' : appt.status === 'cancelled' ? 'danger' : 'cold'}>{label(appt.status)}</Badge>
+            <div className="row gap-4">
+              <Badge tone={appt.status === 'completed' ? 'good' : appt.status === 'cancelled' ? 'danger' : appt.status === 'no_show' ? 'warm' : 'cold'}>
+                {appt.status === 'no_show' ? 'Missed' : label(appt.status)}
+              </Badge>
+              {appt.status === 'scheduled' && can('appointments:write') && (
+                <Button size="sm" onClick={() => setClosing(appt)}>Update</Button>
+              )}
+            </div>
           </div>
+          {appt.status === 'scheduled' && isOverdue(appt.starts_at) && (
+            <div className="banner warn mt-2">
+              <Icon name="alert" size={14} />
+              <span>This visit has passed and has not been closed off.</span>
+            </div>
+          )}
         </div>
       ))}
+      {closing && (
+        <AppointmentOutcome
+          appointment={closing}
+          onClose={() => setClosing(null)}
+          onSaved={onRefresh}
+        />
+      )}
     </div>
   );
 }
@@ -655,6 +712,20 @@ function FileList({ documents, onAdd }: { documents: any[]; onAdd: () => void })
   );
 }
 
+const STOP_REASON: Record<string, string> = {
+  contacted: 'the salesperson made contact',
+  customer_replied: 'the customer replied',
+  appointment_booked: 'a visit was booked',
+  quote_responded: 'the customer answered the quotation',
+  won: 'the deal was won',
+  lost: 'the lead was lost',
+  paused: 'automation was paused on this lead',
+  opted_out: 'the contact opted out',
+  stopped_manually: 'stopped by hand',
+  appointment_cancelled: 'the appointment was cancelled',
+  rule_disabled: 'the rule was switched off',
+};
+
 function AutomationList({ runs, lead, onRefresh }: { runs: any[]; lead: any; onRefresh: () => void }) {
   const toast = useToast();
   const { can } = useSession();
@@ -679,32 +750,65 @@ function AutomationList({ runs, lead, onRefresh }: { runs: any[]; lead: any; onR
           </Button>
         )}
       </div>
+      {lead.messaging_opt_out && (
+        <div className="banner warn">
+          <Icon name="alert" size={15} />
+          <span>This contact has opted out of automatic messages, so no sequence will message them.</span>
+        </div>
+      )}
       {runs.length === 0 ? (
         <EmptyState icon="automation" title="No automation has run" message="Sequences start when a lead is created, becomes hot, or a quotation is sent." />
-      ) : runs.map((run) => (
-        <div key={run.id} className="card" style={{ padding: 12 }}>
-          <div className="row between wrap gap-4">
-            <div>
-              <div className="strong">{run.rule_name}</div>
-              <div className="tiny dim">
-                Started {relative(run.started_at)} · step {run.step_index}
-                {run.next_run_at && run.status === 'active' ? ` · next step ${relative(run.next_run_at)}` : ''}
-                {run.stopped_reason ? ` · stopped: ${run.stopped_reason.replace(/_/g, ' ')}` : ''}
+      ) : runs.map((run) => {
+        const lines: string[] = (run.log ?? []).flatMap((entry: any) => entry.entries ?? []);
+        // A line that says something was not sent is the one worth seeing.
+        const failed = lines.filter((line) => /not sent|failed|could not/i.test(line));
+        return (
+          <div key={run.id} className="card" style={{ padding: 12 }}>
+            <div className="row between wrap gap-4">
+              <div style={{ minWidth: 0 }}>
+                <div className="strong">{run.rule_name}</div>
+                <div className="tiny dim">
+                  Started {relative(run.started_at)} · {run.step_index} step{run.step_index === 1 ? '' : 's'} done
+                  {run.stopped_reason ? ` · stopped: ${STOP_REASON[run.stopped_reason] ?? run.stopped_reason.replace(/_/g, ' ')}` : ''}
+                </div>
+                {run.status === 'active' && run.next_run_at && (
+                  <div className="small" style={{ marginTop: 2, color: 'var(--accent-ink)' }}>
+                    → Next step {relative(run.next_run_at)}
+                  </div>
+                )}
+              </div>
+              <div className="row gap-4">
+                <Badge tone={run.status === 'active' ? 'accent' : run.status === 'failed' ? 'danger' : run.status === 'completed' ? 'good' : ''}>
+                  {label(run.status)}
+                </Badge>
+                {run.status === 'active' && can('leads:write') && (
+                  <Button
+                    size="sm" variant="ghost"
+                    onClick={async () => {
+                      await post(`/leads/${lead.id}/automation/${run.id}/stop`);
+                      onRefresh();
+                      toast.success('Sequence stopped.', 'The other sequences on this lead keep running.');
+                    }}
+                  >
+                    Stop
+                  </Button>
+                )}
               </div>
             </div>
-            <Badge tone={run.status === 'active' ? 'accent' : run.status === 'failed' ? 'danger' : run.status === 'completed' ? 'good' : ''}>
-              {label(run.status)}
-            </Badge>
+            {failed.length > 0 && (
+              <div className="banner warn" style={{ marginTop: 8 }}>
+                <Icon name="alert" size={14} />
+                <span>{failed[failed.length - 1]}</span>
+              </div>
+            )}
+            {lines.length > 0 && (
+              <ul className="small muted" style={{ margin: '8px 0 0', paddingLeft: 16 }}>
+                {lines.map((line: string, index: number) => <li key={index}>{line}</li>)}
+              </ul>
+            )}
           </div>
-          {run.log?.length > 0 && (
-            <ul className="small muted" style={{ margin: '8px 0 0', paddingLeft: 16 }}>
-              {run.log.flatMap((entry: any) => entry.entries ?? []).map((line: string, index: number) => (
-                <li key={index}>{line}</li>
-              ))}
-            </ul>
-          )}
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -799,72 +903,6 @@ function CallDialog({ lead, onClose, onSaved }: { lead: any; onClose: () => void
         <div className="field">
           <label>What was said</label>
           <textarea rows={4} value={body} onChange={(e) => setBody(e.target.value)} placeholder="Key points, objections, what you agreed." />
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-function MessageDialog({ lead, channel, onClose, onSaved }: { lead: any; channel: 'email' | 'whatsapp'; onClose: () => void; onSaved: () => void }) {
-  const [subject, setSubject] = useState('');
-  const [body, setBody] = useState('');
-  const [sending, setSending] = useState(false);
-  const toast = useToast();
-
-  const { data: channels } = useQuery({ queryKey: ['channels'], queryFn: () => get('/messages/channels'), staleTime: 120_000 });
-  const info = channels?.channels?.find((c: any) => c.key === channel);
-  const connected = info?.connected;
-
-  const send = async () => {
-    setSending(true);
-    try {
-      await post('/messages/send', { lead_id: lead.id, channel, subject: subject || undefined, body });
-      toast.success(`${channel === 'email' ? 'Email' : 'WhatsApp message'} sent.`);
-      onSaved(); onClose();
-    } catch (err) { toast.error(err); } finally { setSending(false); }
-  };
-
-  const logManually = async () => {
-    setSending(true);
-    try {
-      await post(`/leads/${lead.id}/activities`, { type: channel, direction: 'outbound', body, title: subject || undefined });
-      toast.success('Message logged.');
-      onSaved(); onClose();
-    } catch (err) { toast.error(err); } finally { setSending(false); }
-  };
-
-  return (
-    <Modal
-      title={channel === 'email' ? `Email ${lead.first_name}` : `WhatsApp ${lead.first_name}`}
-      subtitle={channel === 'email' ? lead.email : lead.phone}
-      onClose={onClose}
-      footer={
-        <>
-          <Button onClick={onClose}>Cancel</Button>
-          <Button onClick={logManually} loading={sending} disabled={!body.trim()}>Log without sending</Button>
-          <Button variant="primary" onClick={send} loading={sending} disabled={!connected || !body.trim()}>Send</Button>
-        </>
-      }
-    >
-      <div className="col gap-6">
-        {!connected && (
-          <div className="banner warn">
-            <Icon name="alert" size={15} />
-            <span>{info?.hint ?? 'This channel is not connected.'} You can still write the message here and log that you sent it yourself.</span>
-          </div>
-        )}
-        {channel === 'email' && (
-          <div className="field">
-            <label>Subject</label>
-            <input value={subject} onChange={(e) => setSubject(e.target.value)} placeholder="Your photovoltaic enquiry" />
-          </div>
-        )}
-        <div className="field">
-          <label>Message</label>
-          <textarea rows={8} value={body} onChange={(e) => setBody(e.target.value)} autoFocus />
-          <span className="hint">
-            This is an operational message about the customer's own enquiry. Marketing messages require recorded consent.
-          </span>
         </div>
       </div>
     </Modal>
@@ -1006,46 +1044,104 @@ function AppointmentDialog({ lead, onClose, onSaved }: { lead: any; onClose: () 
     const d = new Date(); d.setDate(d.getDate() + 2); d.setHours(10, 0, 0, 0);
     return toInputDateTime(d.toISOString());
   });
+  const [durationMin, setDurationMin] = useState(60);
   const [technicianId, setTechnicianId] = useState('');
   const [location, setLocation] = useState([lead.address, lead.city].filter(Boolean).join(', '));
+  const [description, setDescription] = useState('');
+  const [notifyCustomer, setNotifyCustomer] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [conflicts, setConflicts] = useState<any[] | null>(null);
   const toast = useToast();
 
   const { data: users } = useQuery({ queryKey: ['users-light'], queryFn: () => get('/settings/users'), staleTime: 300_000 });
   const technicians = (users?.users ?? []).filter((u: any) => u.status === 'active');
+  const { data: channelData } = useQuery({
+    queryKey: ['channels', lead.id],
+    queryFn: () => get(`/messages/channels?lead_id=${lead.id}`),
+    staleTime: 60_000,
+  });
+  const canMessage = (channelData?.channels ?? []).some(
+    (c: any) => ['email', 'whatsapp'].includes(c.key) && c.connected && c.reachable,
+  );
+
+  const titleFor = (next: string) => ({
+    site_survey: `Site survey — ${lead.first_name} ${lead.last_name}`,
+    sales_meeting: `Meeting — ${lead.first_name} ${lead.last_name}`,
+    call: `Call — ${lead.first_name} ${lead.last_name}`,
+    installation: `Installation — ${lead.first_name} ${lead.last_name}`,
+    service: `Service visit — ${lead.first_name} ${lead.last_name}`,
+  } as Record<string, string>)[next] ?? title;
+
+  /** `force` books over a clash the user has now seen. */
+  const book = async (force = false) => {
+    setSaving(true);
+    try {
+      const starts = fromInputDateTime(startsAt);
+      if (!starts) { toast.show('Choose a valid date and time.', 'error'); setSaving(false); return; }
+      const result = await post('/appointments', {
+        lead_id: lead.id, type, title,
+        starts_at: starts,
+        ends_at: new Date(new Date(starts).getTime() + durationMin * 60_000).toISOString(),
+        technician_id: technicianId || undefined,
+        location: location || undefined,
+        description: description || undefined,
+        notify_customer: notifyCustomer && canMessage,
+        allow_conflict: force,
+      });
+      const notification = result?.notification;
+      if (notification && !notification.sent) {
+        // Booked, but be explicit that the customer was not told.
+        toast.show(`Booked. The customer was NOT told: ${notification.reason}`, 'error');
+      } else if (notification?.sent) {
+        toast.success('Appointment booked.', `Confirmation sent by ${notification.channel}.`);
+      } else {
+        toast.success('Appointment booked.');
+      }
+      onSaved(); onClose();
+    } catch (err: any) {
+      if (err?.details?.conflicts) setConflicts(err.details.conflicts);
+      else toast.error(err);
+    } finally { setSaving(false); }
+  };
 
   return (
     <Modal
       title="Book an appointment" onClose={onClose}
       footer={
         <>
-          <Button onClick={onClose}>Cancel</Button>
-          <Button
-            variant="primary" loading={saving} disabled={!title.trim()}
-            onClick={async () => {
-              setSaving(true);
-              try {
-                await post('/appointments', {
-                  lead_id: lead.id, type, title,
-                  starts_at: fromInputDateTime(startsAt),
-                  technician_id: technicianId || undefined,
-                  location: location || undefined,
-                });
-                toast.success('Appointment booked.');
-                onSaved(); onClose();
-              } catch (err) { toast.error(err); } finally { setSaving(false); }
-            }}
-          >
+          <Button onClick={onClose} disabled={saving}>Cancel</Button>
+          {conflicts && (
+            <Button loading={saving} onClick={() => book(true)}>Book anyway</Button>
+          )}
+          <Button variant="primary" loading={saving} disabled={!title.trim()} onClick={() => book(false)}>
             Book
           </Button>
         </>
       }
     >
       <div className="col gap-6">
+        {conflicts && (
+          <div className="banner warn">
+            <Icon name="alert" size={15} />
+            <div className="grow">
+              <strong>That slot is already taken.</strong>
+              <ul style={{ margin: '4px 0 0', paddingLeft: 16 }}>
+                {conflicts.map((c: any) => (
+                  <li key={c.id} className="small">{c.user_name} — {c.title}, {dateTime(c.starts_at)}</li>
+                ))}
+              </ul>
+              <div className="small">Pick another time, choose someone else, or book it anyway.</div>
+            </div>
+          </div>
+        )}
+
         <div className="grid c2">
           <div className="field">
             <label>Type</label>
-            <select value={type} onChange={(e) => setType(e.target.value)}>
+            <select
+              value={type}
+              onChange={(e) => { setType(e.target.value); setTitle(titleFor(e.target.value)); setConflicts(null); }}
+            >
               <option value="site_survey">Technical site survey</option>
               <option value="sales_meeting">Sales meeting</option>
               <option value="call">Scheduled call</option>
@@ -1055,25 +1151,59 @@ function AppointmentDialog({ lead, onClose, onSaved }: { lead: any; onClose: () 
           </div>
           <div className="field">
             <label>Date and time</label>
-            <input type="datetime-local" value={startsAt} onChange={(e) => setStartsAt(e.target.value)} />
+            <input
+              type="datetime-local" value={startsAt}
+              onChange={(e) => { setStartsAt(e.target.value); setConflicts(null); }}
+            />
           </div>
         </div>
-        <div className="field">
-          <label>Title</label>
-          <input value={title} onChange={(e) => setTitle(e.target.value)} />
+        <div className="grid c2">
+          <div className="field">
+            <label>Title</label>
+            <input value={title} onChange={(e) => setTitle(e.target.value)} />
+          </div>
+          <div className="field">
+            <label>How long?</label>
+            <select value={durationMin} onChange={(e) => { setDurationMin(Number(e.target.value)); setConflicts(null); }}>
+              <option value={30}>30 minutes</option>
+              <option value={60}>1 hour</option>
+              <option value={90}>1½ hours</option>
+              <option value={120}>2 hours</option>
+              <option value={240}>Half a day</option>
+              <option value={480}>A full day</option>
+            </select>
+          </div>
         </div>
         <div className="field">
           <label>Address</label>
           <input value={location} onChange={(e) => setLocation(e.target.value)} />
         </div>
         <div className="field">
-          <label>Technician</label>
-          <select value={technicianId} onChange={(e) => setTechnicianId(e.target.value)}>
+          <label>Who is going?</label>
+          <select
+            value={technicianId}
+            onChange={(e) => { setTechnicianId(e.target.value); setConflicts(null); }}
+          >
             <option value="">Assign later</option>
             {technicians.map((u: any) => <option key={u.id} value={u.id}>{u.full_name} ({u.role_label})</option>)}
           </select>
           <span className="hint">A site survey with a technician creates the on-site checklist automatically.</span>
         </div>
+        <div className="field">
+          <label>Notes for whoever attends (optional)</label>
+          <textarea rows={2} value={description} onChange={(e) => setDescription(e.target.value)} />
+        </div>
+
+        <label className="check">
+          <input
+            type="checkbox" checked={notifyCustomer && canMessage} disabled={!canMessage}
+            onChange={(e) => setNotifyCustomer(e.target.checked)}
+          />
+          <span>
+            Send {lead.first_name} a confirmation
+            {!canMessage && <span className="dim"> — no channel is connected, so nothing can be sent yet</span>}
+          </span>
+        </label>
       </div>
     </Modal>
   );

@@ -246,6 +246,9 @@ CREATE TABLE IF NOT EXISTS leads (
   -- The customer asked for a price, rather than us having sent one. It is the
   -- single strongest early qualifier, so it is recorded from the moment it is known.
   requested_quote INTEGER NOT NULL DEFAULT 0,
+  -- "Do not contact me automatically." Blocks automated sends on every channel;
+  -- a person can still send an operational message by hand.
+  messaging_opt_out INTEGER NOT NULL DEFAULT 0,
 
   -- lifecycle
   first_contacted_at TEXT,
@@ -433,11 +436,18 @@ CREATE TABLE IF NOT EXISTS appointments (
   technician_id TEXT REFERENCES users(id) ON DELETE SET NULL,
   status        TEXT NOT NULL DEFAULT 'scheduled' CHECK (status IN ('scheduled','completed','cancelled','no_show')),
   outcome_note  TEXT,
+  -- Set only when a provider actually accepted the confirmation message.
+  confirmation_sent_at TEXT,
+  -- When the reminder was ISSUED (the sequence started), not when it arrived.
+  -- It is the guard that stops one appointment being reminded twice; whether the
+  -- message went out is recorded on the message row and the sequence log.
+  reminder_sent_at     TEXT,
   created_by    TEXT REFERENCES users(id) ON DELETE SET NULL,
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_appt_org_time ON appointments(org_id, starts_at);
+CREATE INDEX IF NOT EXISTS idx_appt_status_time ON appointments(status, starts_at);
 CREATE INDEX IF NOT EXISTS idx_appt_assignee ON appointments(org_id, assignee_id, starts_at);
 CREATE INDEX IF NOT EXISTS idx_appt_tech ON appointments(org_id, technician_id, starts_at);
 
@@ -446,6 +456,9 @@ CREATE INDEX IF NOT EXISTS idx_appt_tech ON appointments(org_id, technician_id, 
 CREATE TABLE IF NOT EXISTS quotations (
   id            TEXT PRIMARY KEY,
   org_id        TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  -- The survey this quotation was built from, when it was. Lets the dashboard
+  -- find surveys that were completed but never quoted.
+  survey_id     TEXT,
   number        TEXT NOT NULL,
   lead_id       TEXT REFERENCES leads(id) ON DELETE CASCADE,
   customer_id   TEXT REFERENCES customers(id) ON DELETE SET NULL,
@@ -662,8 +675,14 @@ CREATE TABLE IF NOT EXISTS automation_runs (
   error         TEXT,
   started_at    TEXT NOT NULL,
   completed_at  TEXT,
+  appointment_id TEXT REFERENCES appointments(id) ON DELETE CASCADE,
+  -- SQLite treats NULLs as distinct in a UNIQUE constraint, so (rule, lead, NULL)
+  -- would not actually deduplicate a lead-only rule. This flattened key does:
+  -- one run per rule per target, with "-" standing in for the empty parts.
+  run_key       TEXT,
   UNIQUE (rule_id, lead_id, quotation_id)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_key ON automation_runs(run_key) WHERE run_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_runs_due ON automation_runs(status, next_run_at);
 CREATE INDEX IF NOT EXISTS idx_runs_lead ON automation_runs(org_id, lead_id);
 

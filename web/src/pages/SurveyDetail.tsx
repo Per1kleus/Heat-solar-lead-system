@@ -4,6 +4,8 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { get, post, patch } from '../lib/api';
 import { Badge, Button, Card, ErrorBlock, Field, Icon, LoadingBlock, useToast } from '../components/ui';
 import { dateTime, relative, label, money } from '../lib/format';
+import QuotationBuilder from '../components/QuotationBuilder';
+import { useSession } from '../lib/session';
 
 /** Mobile-first survey form: big controls, camera upload, autosaves as it goes. */
 export default function SurveyDetail() {
@@ -12,6 +14,7 @@ export default function SurveyDetail() {
   const queryClient = useQueryClient();
   const toast = useToast();
   const fileInput = useRef<HTMLInputElement>(null);
+  const { can } = useSession();
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ['survey', id],
@@ -27,6 +30,7 @@ export default function SurveyDetail() {
   const [feasible, setFeasible] = useState<boolean | null>(null);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [uploading, setUploading] = useState(false);
+  const [building, setBuilding] = useState(false);
 
   useEffect(() => {
     if (!data?.survey) return;
@@ -256,16 +260,42 @@ export default function SurveyDetail() {
           </div>
         )}
 
-        {done && survey.estimated_cost ? (
-          <div className="banner success">
-            <Icon name="check" size={15} />
-            <span>
-              Completed {relative(survey.completed_at)} — {money(survey.estimated_cost)} estimated.
-              The findings are on the lead timeline.
-            </span>
-          </div>
-        ) : null}
+        {done && (
+          <Card>
+            <div className="row gap-6 wrap">
+              <span style={{ color: 'var(--good)' }}><Icon name="check" size={22} /></span>
+              <div className="grow" style={{ minWidth: 180 }}>
+                <h3 style={{ margin: 0 }}>Survey completed</h3>
+                <p className="small muted" style={{ margin: '2px 0 0' }}>
+                  {relative(survey.completed_at)}
+                  {survey.estimated_cost ? ` — ${money(survey.estimated_cost)} estimated` : ''}.
+                  The findings are on the lead timeline.
+                </p>
+              </div>
+              {survey.lead_id && can('quotes:write') && (
+                <Button variant="primary" icon="quote" onClick={() => setBuilding(true)}>
+                  Create quotation
+                </Button>
+              )}
+            </div>
+            {survey.lead_id && can('quotes:write') && (
+              <p className="tiny dim" style={{ margin: '10px 0 0' }}>
+                The quotation opens pre-filled from this survey and your price list. You review and
+                edit every line before it is created — nothing is sent to the customer automatically.
+              </p>
+            )}
+          </Card>
+        )}
       </div>
+
+      {building && (
+        <QuotationBuilder
+          leadId={survey.lead_id}
+          surveyId={survey.id}
+          onClose={() => setBuilding(false)}
+          onSaved={(quote: any) => { setBuilding(false); navigate(`/app/quotations/${quote.id}`); }}
+        />
+      )}
     </div>
   );
 }

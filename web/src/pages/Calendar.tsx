@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { get, post } from '../lib/api';
 import { Badge, Button, Card, EmptyState, ErrorBlock, Icon, LoadingBlock, Tabs, useToast } from '../components/ui';
 import { time, dateTime, isOverdue, label } from '../lib/format';
+import AppointmentOutcome from '../components/AppointmentOutcome';
 
 type View = 'day' | 'week' | 'month';
 
@@ -15,6 +16,7 @@ export default function Calendar() {
   const toast = useToast();
   const [dragEvent, setDragEvent] = useState<any>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const [closing, setClosing] = useState<any | null>(null);
 
   const { from, to, days } = useMemo(() => buildRange(view, anchor), [view, anchor]);
 
@@ -99,6 +101,7 @@ export default function Calendar() {
           <DayList
             events={byDay.get(anchor.toDateString()) ?? []}
             onOpen={(event) => event.lead_id && navigate(`/app/leads/${event.lead_id}`)}
+            onClose={(event) => setClosing({ id: event.id, title: event.title, starts_at: event.start })}
           />
         ) : (
           <>
@@ -158,32 +161,54 @@ export default function Calendar() {
         <span className="row gap-2"><span className="cal-event quote_deadline" style={{ padding: '1px 6px' }}>Quote expiry</span></span>
         <span className="dim">Drag an item to another day to reschedule it.</span>
       </div>
+
+      {closing && (
+        <AppointmentOutcome
+          appointment={closing}
+          onClose={() => setClosing(null)}
+          onSaved={() => { setClosing(null); refetch(); }}
+        />
+      )}
     </div>
   );
 }
 
-function DayList({ events, onOpen }: { events: any[]; onOpen: (event: any) => void }) {
+function DayList({
+  events, onOpen, onClose,
+}: { events: any[]; onOpen: (event: any) => void; onClose: (event: any) => void }) {
   if (events.length === 0) {
     return <EmptyState icon="calendar" title="Nothing scheduled today" message="Enjoy it, or pick up a lead from the pipeline." />;
   }
   return (
     <div>
       {events.map((event) => (
-        <button
+        // The row is a card with its own action, so the clickable part is the
+        // inner button rather than the whole row.
+        <div
           key={`${event.kind}-${event.id}`} className="attention-item"
-          style={{ width: '100%', textAlign: 'left', border: 0, borderBottom: '1px solid var(--border)', background: 'none', font: 'inherit' }}
-          onClick={() => onOpen(event)}
+          style={{ borderBottom: '1px solid var(--border)' }}
         >
-          <div style={{ minWidth: 52 }} className="strong">{time(event.start)}</div>
-          <div className="grow" style={{ minWidth: 0 }}>
-            <div className="truncate strong">{event.title}</div>
-            <div className="tiny dim truncate">{event.subtitle ?? ''}{event.owner ? ` · ${event.owner}` : ''}</div>
-          </div>
+          <button
+            className="row gap-4 grow"
+            style={{ minWidth: 0, textAlign: 'left', border: 0, background: 'none', font: 'inherit', cursor: 'pointer', padding: 0 }}
+            onClick={() => onOpen(event)}
+          >
+            <span style={{ minWidth: 52 }} className="strong">{time(event.start)}</span>
+            <span className="grow" style={{ minWidth: 0 }}>
+              <span className="truncate strong" style={{ display: 'block' }}>{event.title}</span>
+              <span className="tiny dim truncate" style={{ display: 'block' }}>
+                {event.subtitle ?? ''}{event.owner ? ` · ${event.owner}` : ''}
+              </span>
+            </span>
+          </button>
           <Badge tone={event.kind === 'task' ? 'accent' : event.kind === 'quote_deadline' ? 'warm' : 'cold'}>
             {event.kind === 'quote_deadline' ? 'expiry' : label(event.type)}
           </Badge>
           {event.kind === 'task' && isOverdue(event.start) && <Badge tone="danger">overdue</Badge>}
-        </button>
+          {event.kind === 'appointment' && isOverdue(event.start) && event.status === 'scheduled' && (
+            <Button size="sm" onClick={() => onClose(event)}>Did it happen?</Button>
+          )}
+        </div>
       ))}
     </div>
   );

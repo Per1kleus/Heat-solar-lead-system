@@ -15,6 +15,7 @@ import { newId } from '../lib/ids.ts';
 import { assertLeadAllowance } from '../lib/billing.ts';
 import { readIdempotent, writeIdempotent } from '../lib/idempotency.ts';
 import { emit } from '../lib/events.ts';
+import { stopAllRuns, stopRun } from '../lib/automation.ts';
 
 export const leadsRouter = Router();
 
@@ -203,8 +204,23 @@ leadsRouter.get('/:id', requirePermission('leads:read:own', 'leads:read:all'), a
     documents: all(
       'SELECT * FROM documents WHERE org_id = ? AND lead_id = ? ORDER BY created_at DESC', [req.ctx.orgId, lead.id],
     ),
+    // The communication panel needs the real send history, failures included.
+    messages: all(
+      `SELECT m.id, m.channel, m.direction, m.status, m.subject, m.body, m.error, m.purpose,
+              m.to_address, m.from_address, m.sent_at, m.created_at, m.automation_run_id,
+              u.first_name AS user_first_name, u.last_name AS user_last_name
+       FROM messages m LEFT JOIN users u ON u.id = m.user_id
+       WHERE m.org_id = ? AND m.lead_id = ? ORDER BY m.created_at DESC LIMIT 50`,
+      [req.ctx.orgId, lead.id],
+    ),
+    last_contact: get<any>(
+      `SELECT occurred_at, type, direction, title FROM activities
+       WHERE org_id = ? AND lead_id = ? AND is_customer_touch = 1
+       ORDER BY occurred_at DESC LIMIT 1`,
+      [req.ctx.orgId, lead.id],
+    ) ?? null,
     automation_runs: all(
-      `SELECT r.id, r.status, r.step_index, r.next_run_at, r.stopped_reason, r.started_at, r.log,
+      `SELECT r.id, r.rule_id, r.status, r.step_index, r.next_run_at, r.stopped_reason, r.started_at, r.log,
               ar.name AS rule_name, ar.trigger_type
        FROM automation_runs r JOIN automation_rules ar ON ar.id = r.rule_id
        WHERE r.org_id = ? AND r.lead_id = ? ORDER BY r.started_at DESC`,
@@ -365,6 +381,53 @@ leadsRouter.post('/:id/automation', requirePermission('leads:write'), ah((req, r
     userId: req.ctx.user.id,
   });
   res.json({ lead: shapeLead(loadLead(req.ctx.orgId, lead.id)) });
+}));
+
+/**
+ * "Do not contact me automatically." Blocks every automated send for this
+ * contact and stops whatever is already running; a person can still send an
+ * operational message by hand, which is what the flag is for.
+ */
+leadsRouter.post('/:id/messaging-opt-out', requirePermission('leads:write'), ah((req, res) => {
+  const { opted_out: optedOut } = z.object({ opted_out: z.boolean() }).parse(req.body);
+  const lead = loadLead(req.ctx.orgId, req.params.id);
+  assertVisible(req, lead);
+  run('UPDATE leads SET messaging_opt_out = ?, updated_at = ? WHERE id = ? AND org_id = ?', [
+    optedOut ? 1 : 0, nowIso(), lead.id, req.ctx.orgId,
+  ]);
+  const stopped = optedOut ? stopAllRuns(req.ctx.orgId, lead.id, 'opted_out') : 0;
+  logActivity({
+    orgId: req.ctx.orgId, leadId: lead.id, type: 'automation',
+    title: optedOut
+      ? 'Contact opted out of automatic messages'
+      : 'Contact may receive automatic messages again',
+    body: stopped > 0 ? `${stopped} running sequence(s) stopped.` : null,
+    userId: req.ctx.user.id,
+  });
+  audit({
+    orgId: req.ctx.orgId, userId: req.ctx.user.id,
+    action: optedOut ? 'lead.messaging_opt_out' : 'lead.messaging_opt_in',
+    entityType: 'lead', entityId: lead.id, entityLabel: `${lead.first_name} ${lead.last_name}`,
+  });
+  res.json({ lead: shapeLead(loadLead(req.ctx.orgId, lead.id)), stopped });
+}));
+
+/** Stops one running sequence on this lead, leaving the others alone. */
+leadsRouter.post('/:id/automation/:runId/stop', requirePermission('leads:write'), ah((req, res) => {
+  const lead = loadLead(req.ctx.orgId, req.params.id);
+  assertVisible(req, lead);
+  const runRow = get<{ id: string; lead_id: string }>(
+    'SELECT id, lead_id FROM automation_runs WHERE id = ? AND org_id = ?', [req.params.runId, req.ctx.orgId],
+  );
+  if (!runRow || runRow.lead_id !== lead.id) throw notFound('That sequence no longer exists.');
+  const stopped = stopRun(req.ctx.orgId, runRow.id, 'stopped_manually');
+  if (stopped) {
+    logActivity({
+      orgId: req.ctx.orgId, leadId: lead.id, type: 'automation',
+      title: 'Follow-up sequence stopped by hand', userId: req.ctx.user.id,
+    });
+  }
+  res.json({ stopped });
 }));
 
 // --- activities -----------------------------------------------------------

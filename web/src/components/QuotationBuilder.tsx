@@ -15,6 +15,9 @@ interface Line {
   unit_price: number;
   discount_pct: number;
   is_optional: boolean;
+  /** Pre-filled from a survey but unconfirmed — the owner must look at it. */
+  needs_review?: boolean;
+  review_reason?: string;
 }
 
 const CATEGORIES = [
@@ -37,9 +40,11 @@ const newLine = (partial: Partial<Line> = {}): Line => ({
 /** Quotation builder. Totals are computed locally for instant feedback and
  *  recomputed authoritatively on the server when saved. */
 export default function QuotationBuilder({
-  leadId, quotation, onClose, onSaved,
+  leadId, quotation, surveyId, onClose, onSaved,
 }: {
   leadId?: string; quotation?: any;
+  /** Pre-fills the builder from a completed site survey. */
+  surveyId?: string;
   onClose: () => void; onSaved: (quote: any) => void;
 }) {
   const { organization } = useSession();
@@ -68,6 +73,16 @@ export default function QuotationBuilder({
   const [notes, setNotes] = useState(quotation?.notes ?? '');
   const [saving, setSaving] = useState(false);
   const [showCatalogue, setShowCatalogue] = useState(false);
+  // Survey answers that would have made this quotation more accurate. Shown, not
+  // guessed at.
+  const [missing, setMissing] = useState<string[]>([]);
+  const [prefilled, setPrefilled] = useState(false);
+
+  const { data: draftData } = useQuery({
+    queryKey: ['quotation-draft', surveyId],
+    queryFn: () => get(`/surveys/${surveyId}/quotation-draft`),
+    enabled: Boolean(surveyId) && !quotation,
+  });
 
   const { data: leadResults } = useQuery({
     queryKey: ['quote-lead-search', debouncedLead],
@@ -93,9 +108,31 @@ export default function QuotationBuilder({
     staleTime: 300_000,
   });
 
+  // A survey fills the builder in: quantities the technician measured, prices from
+  // the company's own list. Everything stays editable, and nothing is invented —
+  // a line the survey could not size arrives flagged for review.
+  useEffect(() => {
+    const draft = draftData?.draft;
+    if (!draft || prefilled) return;
+    setPrefilled(true);
+    if (draft.lead_id) setSelectedLead(draft.lead_id);
+    setTitle(draft.title ?? '');
+    if (draft.description) setDescription(draft.description);
+    if (draft.notes) setNotes(draft.notes);
+    if (draft.items?.length) {
+      setLines(draft.items.map((item: any) => newLine({
+        category: item.category, name: item.name, description: item.description ?? undefined,
+        quantity: item.quantity, unit: item.unit, unit_price: item.unit_price,
+        discount_pct: 0, is_optional: item.is_optional,
+        needs_review: item.needs_review, review_reason: item.review_reason,
+      })));
+    }
+    setMissing(draft.missing ?? []);
+  }, [draftData, prefilled]);
+
   // Seed the title and terms from the lead once it is known.
   useEffect(() => {
-    if (!leadData?.lead || title) return;
+    if (!leadData?.lead || title || surveyId) return;
     const lead = leadData.lead;
     const parts: string[] = [];
     if (lead.pv_desired_kwp) parts.push(`${lead.pv_desired_kwp} kWp photovoltaic system`);
@@ -147,9 +184,13 @@ export default function QuotationBuilder({
     try {
       const payload = {
         lead_id: selectedLead,
+        survey_id: surveyId,
         title: title.trim(),
         description: description || undefined,
-        items: valid.map(({ key, ...line }, index) => ({ ...line, position: index })),
+        // needs_review/review_reason are builder-only hints; the server never sees them.
+        items: valid.map(({ key, needs_review: _r, review_reason: _w, ...line }, index) => ({
+          ...line, position: index,
+        })),
         discount_type: discountType,
         discount_value: Number(discountValue) || 0,
         vat_rate: Number(vatRate),
@@ -192,6 +233,34 @@ export default function QuotationBuilder({
       }
     >
       <div className="col gap-8">
+        {draftData?.draft && (
+          <div className="banner info" style={{ margin: 0 }}>
+            <Icon name="survey" size={15} />
+            <div className="grow">
+              <strong>Pre-filled from the site survey.</strong>{' '}
+              Quantities come from what the technician measured and prices from your price list.
+              Check every line before you save — nothing here has been guessed.
+              {draftData.draft.source?.photo_count > 0 && (
+                <span> {draftData.draft.source.photo_count} survey photo(s) are on the lead.</span>
+              )}
+              {missing.length > 0 && (
+                <ul style={{ margin: '6px 0 0', paddingLeft: 16 }}>
+                  {missing.map((entry) => <li key={entry} className="small">{entry}</li>)}
+                </ul>
+              )}
+            </div>
+          </div>
+        )}
+        {draftData?.existing?.length > 0 && (
+          <div className="banner" style={{ margin: 0 }}>
+            <Icon name="quote" size={15} />
+            <span>
+              This lead already has {draftData.existing.length} quotation(s)
+              ({draftData.existing.map((q: any) => q.number).join(', ')}). Creating another one is fine —
+              it will get its own number.
+            </span>
+          </div>
+        )}
         {!leadId && !quotation && (
           <Field label="Which lead is this for?" required>
             {selectedLead && leadData?.lead ? (
@@ -314,9 +383,23 @@ export default function QuotationBuilder({
                     <td>
                       <input
                         type="number" min="0" step="0.01" value={line.quantity}
-                        onChange={(e) => update(line.key, { quantity: Number(e.target.value) })}
-                        style={{ textAlign: 'right' }} aria-label="Quantity"
+                        onChange={(e) => update(line.key, {
+                          quantity: Number(e.target.value),
+                          // Typing a quantity IS the review.
+                          needs_review: false, review_reason: undefined,
+                        })}
+                        style={{
+                          textAlign: 'right',
+                          borderColor: line.needs_review ? 'var(--warm)' : undefined,
+                        }}
+                        aria-label="Quantity"
+                        title={line.review_reason}
                       />
+                      {line.needs_review && (
+                        <div className="tiny" style={{ color: 'var(--warm)', marginTop: 3 }} title={line.review_reason}>
+                          Needs review
+                        </div>
+                      )}
                     </td>
                     <td>
                       <input value={line.unit} onChange={(e) => update(line.key, { unit: e.target.value })} aria-label="Unit" />

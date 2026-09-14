@@ -55,7 +55,8 @@ and indexed, so it stays cheap as the database grows:
 | score decay | re-scores the open leads with the oldest scores, so staleness actually bites |
 | leads with no next action | the rule that makes forgetting a lead visible |
 | expiring quotations | expires them and tells the owner |
-| tomorrow's appointments | the reminder the day before |
+| tomorrow's appointments | reminds the team, and issues the customer reminder once per appointment |
+| missed appointments | surfaces a visit that passed without being closed off |
 | lost-lead recovery | creates the recovery task on the date you chose |
 | retention | once a day, removes lost leads past your retention setting, and writes it to the audit log |
 | cleanup | idempotency keys older than 2 days, rate-limit windows older than a day, expired sessions, read notifications older than 60 days |
@@ -72,6 +73,7 @@ table of what is real:
 |---|---|---|
 | **Email (SMTP)** | sends, attaches the quotation PDF, records the message | the send is **refused** with a clear message; the message row is stored with status `blocked` and the reason, and the lead timeline says **"NOT sent"** |
 | **WhatsApp Business Cloud** | sends through the Cloud API | the same refusal; no pretending |
+| **SMS** | — | **not implemented.** The channel reports itself as unavailable everywhere rather than offering a button that cannot work |
 | **Telephony** | logs calls automatically | click-to-call still works from the browser; the call is logged manually |
 | **AI (Claude)** | summaries, suggested next actions, draft replies | the AI panels say a key is needed and do nothing else |
 | **Meta / Google / Make / Zapier** | post leads to the intake endpoint with your API key | nothing to connect — see [`embedding.md`](embedding.md) |
@@ -108,6 +110,10 @@ went out" are never confused with each other.
 
 - **Consent is recorded, not assumed.** The website form's marketing box is
   separate and unticked; the lawful basis is stored on the lead.
+- **"Do not contact me automatically" is a separate switch.** Setting it on a
+  lead blocks every automated send, stops the sequences already running, and is
+  audited. It does not stop a person answering the customer's own enquiry by
+  hand, which is why it is distinct from marketing consent.
 - **Operational and marketing messages are separated in the data model.** A
   marketing send without a lawful basis is refused and the refusal is logged. An
   operational message — "your quotation is attached" — is not marketing and is not
@@ -136,7 +142,7 @@ disk; there is no queue, no cache and no second database to operate.
 ## Tests
 
 ```bash
-npm test          # 44 domain tests
+npm test          # 67 domain tests
 npm run typecheck # server and client
 npm run build     # production build of both
 ```

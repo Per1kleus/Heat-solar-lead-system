@@ -20,6 +20,12 @@ So every lead always carries an **owner**, a **status**, a **temperature**, a
 interaction history** — and anything missing a next action is flagged on the
 dashboard until someone deals with it.
 
+The dashboard opens on **what needs you now**: one ranked list of overdue
+follow-ups, hot leads going quiet, surveys waiting for a quotation, quotations
+the customer opened but never answered, visits nobody closed off, and sold jobs
+with no installation date — each with the customer's name, the reason, the money
+at stake, and the button that does the thing.
+
 ---
 
 ## Running it
@@ -83,8 +89,24 @@ and its owner is notified.
   and heat-pump set (existing system, fuel, annual cost, m², floors, emitters,
   insulation, DHW, cooling, estimated kW, removal).
 
+### Talk to the customer
+Every lead has a **communication panel**: phone, email, preferred channel, when
+they were last contacted, which channels actually work right now, and the message
+history — including what was **not** sent and why. WhatsApp, email and
+click-to-call are one button each, and the composer opens on a real template
+already rendered for that customer, which you edit before sending.
+
+Installer-specific templates ship for first contact, survey confirmation and
+reminder, quotation sent and follow-up, appointment confirmation, reminder,
+change and cancellation, installation confirmation and the after-installation
+check-in.
+
+A contact can also say "do not contact me automatically": that blocks every
+automated send and stops the running sequences, while a person can still write to
+them by hand about their own enquiry.
+
 ### Follow up
-Eight automation rules ship switched on, exactly as specified:
+Nine automation rules ship switched on:
 
 1. **New lead** → assign, notify, first follow-up in 30 minutes, then day 1, 3, 7 and 14.
 2. **No contact** → alert the owner when a lead goes quiet.
@@ -95,12 +117,26 @@ Eight automation rules ship switched on, exactly as specified:
 7. **Won** → record the revenue, stop the sales sequences, create the customer and
    open the installation handover.
 8. **No next action** → flag the lead prominently.
+9. **Appointment reminder** → one message to the customer the evening before a visit.
+
+Three further sequences — day 1/3/7/14 messages on a new lead, day 2/5/10/20 on a
+quotation, and a check-in after the installation — ship **switched off**, because
+they message real customers. Turn them on once a channel is connected and you are
+happy with the wording.
 
 Sequences stop automatically when the customer replies, an appointment is booked,
-the deal is won or lost, or a salesperson pauses automation on that lead. A visual
-builder lets you add your own rules without programming.
+the deal is won or lost, the contact opts out, or a salesperson pauses automation
+on that lead. Each lead shows its running sequences with the next scheduled step,
+everything already done, anything that failed, and a Stop button. A visual builder
+lets you add your own rules without programming.
 
 ### Quote
+- **Straight from the survey.** A completed site survey offers **Create
+  quotation**, and the builder opens pre-filled: quantities from what the
+  technician measured, prices from your own price list. Anything the survey did
+  not establish is flagged **Needs review** with the reason rather than guessed,
+  and you edit every line before the quotation is created. Nothing is sent to the
+  customer without you.
 - Builder with your own price list (PV, battery, heat pump, EV charger), line
   discounts, optional extras priced separately, VAT and validity.
 - **Real PDF generation** — a proper A4 proposal with your logo and terms.
@@ -109,6 +145,12 @@ builder lets you add your own rules without programming.
 - Statuses: draft → sent → viewed → awaiting response → accepted / rejected / expired.
 
 ### Deliver
+- **Appointments** for site surveys, sales meetings, calls, installations and
+  service visits. Double bookings are refused with a note of what is already in
+  the diary (and can be overridden deliberately); a confirmation to the customer
+  is one checkbox, and the result is reported honestly. Moving one moves its
+  survey and its task and re-arms the reminder; cancelling closes both. A visit
+  that quietly passed is surfaced as "did this happen?" rather than left open.
 - **Site surveys** with per-project-type checklists (roof, electrical, system
   proposal, access for PV; existing system, building, installation for heat pumps),
   photo upload straight from a phone camera, feasibility and a recommended system
@@ -135,7 +177,7 @@ server/                 Node 22 + Express + SQLite (node:sqlite, no native deps)
                         messaging, billing, auth, permissions, audit
   src/routes/           the HTTP surface, one router per area
   src/jobs/scheduler.ts the tick that drives automation and overdue alerts
-  test/                 44 domain tests (node:test)
+  test/                 67 domain tests (node:test)
 web/                    React 19 + Vite + TanStack Query
   src/pages/            one file per screen
   src/components/       shared UI, lead form, quotation builder
@@ -213,7 +255,7 @@ starts with the full Growth feature set plus AI.
 ## Tests
 
 ```bash
-npm test          # 44 domain tests: scoring, quotations, automation, tenancy, limits
+npm test          # 67 domain tests: scoring, quotations, automation, tenancy, limits
 npm run typecheck # server and client
 npm run build     # production build of both
 ```

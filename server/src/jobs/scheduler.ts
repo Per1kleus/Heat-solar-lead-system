@@ -26,6 +26,7 @@ export function startScheduler(): { stop: () => void } {
       sweepLeadsWithoutNextAction();
       sweepExpiringQuotations();
       sweepUpcomingAppointments();
+      sweepMissedAppointments();
       sweepLostRecovery();
       cleanupIdempotencyKeys();
       applyRetentionDaily();
@@ -169,10 +170,15 @@ function sweepExpiringQuotations(): void {
   );
 }
 
-/** A reminder the evening before each appointment. */
+/**
+ * The evening before each appointment: the team is notified, and the customer
+ * reminder sequence is started once. Whether a reminder message actually goes
+ * out is up to the rule and the connected channels — this only issues it.
+ */
 function sweepUpcomingAppointments(): void {
-  const upcoming = all<{ id: string; org_id: string; title: string; starts_at: string; assignee_id: string | null; technician_id: string | null; lead_id: string | null; location: string | null }>(
-    `SELECT id, org_id, title, starts_at, assignee_id, technician_id, lead_id, location FROM appointments
+  const upcoming = all<{ id: string; org_id: string; title: string; starts_at: string; assignee_id: string | null; technician_id: string | null; lead_id: string | null; location: string | null; reminder_sent_at: string | null }>(
+    `SELECT id, org_id, title, starts_at, assignee_id, technician_id, lead_id, location, reminder_sent_at
+     FROM appointments
      WHERE status = 'scheduled' AND starts_at > ? AND starts_at < ? LIMIT 200`,
     [nowIso(), addDays(new Date(), 1)],
   );
@@ -186,6 +192,40 @@ function sweepUpcomingAppointments(): void {
         leadId: appt.lead_id, dedupeKey: `appt:${appt.id}:${userId}`,
       });
     }
+    if (!appt.reminder_sent_at) {
+      // Marked first: one reminder per appointment, even if the rule fails.
+      run('UPDATE appointments SET reminder_sent_at = ? WHERE id = ?', [nowIso(), appt.id]);
+      emit({
+        type: 'appointment_reminder_due',
+        orgId: appt.org_id, leadId: appt.lead_id, appointmentId: appt.id,
+      });
+    }
+  }
+}
+
+/**
+ * An appointment nobody closed off. It stays "scheduled" for a grace period and
+ * is then surfaced as missed, because a visit that silently passed is exactly the
+ * kind of thing that loses a sale.
+ */
+function sweepMissedAppointments(): void {
+  const missed = all<{ id: string; org_id: string; title: string; starts_at: string; lead_id: string | null; assignee_id: string | null; technician_id: string | null }>(
+    `SELECT id, org_id, title, starts_at, lead_id, assignee_id, technician_id FROM appointments
+     WHERE status = 'scheduled' AND ends_at < ? LIMIT 200`,
+    [addMinutes(new Date(), -12 * 60)],
+  );
+  for (const appt of missed) {
+    const userId = appt.assignee_id ?? appt.technician_id;
+    if (userId) {
+      notify({
+        orgId: appt.org_id, userId, type: 'appointment_soon', severity: 'warning',
+        title: `Did this visit happen? ${appt.title}`,
+        body: `It was booked for ${new Date(appt.starts_at).toLocaleString('en-GB')} and has not been closed off.`,
+        link: appt.lead_id ? `/leads/${appt.lead_id}` : '/calendar',
+        leadId: appt.lead_id, dedupeKey: `appt-missed:${appt.id}`,
+      });
+    }
+    emit({ type: 'appointment_missed', orgId: appt.org_id, leadId: appt.lead_id, appointmentId: appt.id });
   }
 }
 

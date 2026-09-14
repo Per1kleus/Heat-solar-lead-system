@@ -48,6 +48,8 @@ already holds; the whole run stops if anything in `stop_on` holds.
 | `lead_idle` | nothing has happened on an open lead | `{ "hours": 24 }` |
 | `no_next_action` | an open lead has no open task | — |
 | `appointment_scheduled` | a survey or meeting is booked | — |
+| `appointment_reminder_due` | an appointment is coming up tomorrow | — |
+| `installation_completed` | a job is handed over to the customer | — |
 
 ### Actions
 
@@ -57,7 +59,7 @@ already holds; the whole run stops if anything in `stop_on` holds.
 | `notify_owner` | `title`, `body`, `severity`, `notification_type` | |
 | `notify_assignee` | `title`, `body`, `severity` | for task-based triggers |
 | `notify_managers` | `title`, `body`, `severity` | owners, admins and sales managers |
-| `send_template` | `template_key`, `channel`, `purpose` | **honest**: see below |
+| `send_template` | `template_key`, `channel`, `purpose` | **honest**: see below. `channel: "preferred"` uses the customer's own choice |
 | `change_stage` | `stage_key` | |
 | `add_tag` | `tag` | |
 | `schedule_recovery` | — | creates the recovery task on the lost lead's recovery date |
@@ -66,9 +68,18 @@ already holds; the whole run stops if anything in `stop_on` holds.
 ### Stop conditions
 
 `contacted`, `customer_replied`, `appointment_booked`, `quote_responded`,
-`won`, `lost`, `paused`. `paused` is the per-lead switch on the lead page —
-a salesperson who is handling something delicately can turn the machine off for
-that one lead without disabling the rule for everyone.
+`won`, `lost`, `paused`, `opted_out`, `appointment_cancelled`.
+
+`paused` is the per-lead switch on the lead page — a salesperson handling
+something delicately can turn the machine off for that one lead without disabling
+the rule for everyone. `opted_out` is the customer's own "do not contact me
+automatically": unlike the rest it is **not** optional, because setting it stops
+every running sequence for that contact whatever the rules say. A person can
+still write to them by hand.
+
+You can also stop one sequence and leave the others running — the Automation tab
+on any lead lists them with their next scheduled step, everything they have
+already done, anything that failed, and a Stop button.
 
 ### Placeholders
 
@@ -96,8 +107,29 @@ text rather than leaking `{{…}}` to a customer.
    and opens the installation handover.
 8. **No next action** — flags the lead so the dashboard can surface it.
 
-You can edit any of them, switch them off, or write your own; the eight are
-marked as system rules only so they can be restored.
+Plus one more that ships on: **appointment reminder** — the evening before a
+booked visit the customer gets a single reminder on their preferred channel.
+
+You can edit any of them, switch them off, or write your own; they are marked as
+system rules only so they can be restored.
+
+## The customer-messaging sequences (off by default)
+
+Three further sequences ship **switched off**, because they send real messages to
+real customers:
+
+| Rule | What it does |
+|---|---|
+| **New lead — message the customer on day 1, 3, 7 and 14** | chases an unanswered enquiry on their preferred channel |
+| **Quotation sent — message the customer on day 2, 5, 10 and 20** | chases an unanswered quotation |
+| **Installation completed — check in three weeks later** | one message asking whether everything works |
+
+Switch them on in Automation once a channel is connected and you are happy with
+the wording. Every step stops the moment the customer replies, books a visit,
+answers the quotation, or the deal is won or lost — and an opted-out contact is
+never messaged at all. Of everything the *default* rules do, exactly two actions
+send anything to a customer: the acknowledgement when the enquiry arrives, and
+the reminder before a visit they booked.
 
 ## What actually happens when a rule runs
 
@@ -126,3 +158,9 @@ running; one that could not do something says so.
   Nothing runs inside the HTTP request that triggered it, so a slow send can
   never slow down the person using the app.
 - **Nothing is lost across a restart.** Due steps are stored, not held in memory.
+- **A channel is resolved before the step runs**, so the log names the channel
+  that was actually used, and a contact with no phone or email is reported rather
+  than silently skipped.
+- **An opt-out wins over the rule.** It is checked when the step runs and again
+  inside the send, so a sequence that was already in flight still cannot message
+  someone who asked not to be.

@@ -62,7 +62,7 @@ export default function Notifications() {
         {data?.unread > 0 && <Button onClick={() => markRead()}>Mark all as read</Button>}
       </div>
 
-      <div className="grid" style={{ gridTemplateColumns: 'minmax(0, 1.6fr) minmax(0, 1fr)', alignItems: 'start', gap: 16 }}>
+      <div className="grid split">
         <Card padded={false}>
           {isLoading ? (
             <div style={{ padding: 14 }}><LoadingBlock rows={5} height={44} /></div>

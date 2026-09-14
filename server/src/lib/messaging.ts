@@ -244,19 +244,183 @@ export function checkMarketingConsent(
   };
 }
 
+/**
+ * Which channels this organisation can actually use, and which one a given lead
+ * should be contacted on. "preferred" resolves to what the customer asked for,
+ * falling back to whatever is connected and reachable — never to a channel the
+ * provider cannot deliver on.
+ */
+export function channelStatus(orgId: string): Record<Channel, { connected: boolean; reason: string }> {
+  const smtp = getIntegration(orgId, 'smtp');
+  const whatsapp = getIntegration(orgId, 'whatsapp_cloud');
+  const telephony = getIntegration(orgId, 'telephony');
+  return {
+    email: {
+      connected: smtp?.status === 'connected',
+      reason: 'Connect your mailbox in Settings → Communication to send email from VoltaFlow.',
+    },
+    whatsapp: {
+      connected: whatsapp?.status === 'connected',
+      reason: 'WhatsApp is not connected. Connect WhatsApp Business in Settings → Communication to enable this feature.',
+    },
+    sms: {
+      // No SMS provider is implemented, so the honest answer is always "no".
+      connected: false,
+      reason: 'SMS is not available yet — no SMS provider is implemented in VoltaFlow.',
+    },
+    phone: {
+      // Click-to-call works from the device with or without a provider; the
+      // integration only adds automatic call logging.
+      connected: true,
+      reason: telephony?.status === 'connected'
+        ? 'Calls are logged automatically by your telephony provider.'
+        : 'Calls open on your device and are logged manually.',
+    },
+  };
+}
+
+export interface ResolvedChannel {
+  /** Where the message would go. Null only when the contact is unreachable. */
+  channel: Channel | null;
+  to: string | null;
+  /** True when a provider is connected and would actually accept the message. */
+  deliverable: boolean;
+  /** Why it is not deliverable — shown to the user verbatim. */
+  reason: string;
+}
+
+/**
+ * Picks the channel a contact should be reached on: their stated preference
+ * first, then whatever else is connected and reachable.
+ *
+ * When nothing is connected this still returns the channel it WOULD have used,
+ * with `deliverable: false`. That matters: the attempt is then recorded as a
+ * blocked message against the right channel and appears on the timeline as "NOT
+ * sent", rather than vanishing. `channel` is null only when the contact has no
+ * address at all, where there is nothing to record an attempt against.
+ */
+export function resolveChannel(
+  orgId: string, lead: { preferred_contact?: string | null; email?: string | null; phone?: string | null },
+  requested?: Channel | 'preferred' | null,
+): ResolvedChannel {
+  const status = channelStatus(orgId);
+  const addressFor = (channel: Channel): string | null =>
+    (channel === 'email' ? lead.email : lead.phone) || null;
+
+  const candidates: Channel[] = [];
+  if (requested && requested !== 'preferred') {
+    candidates.push(requested);
+  } else {
+    const wanted = lead.preferred_contact;
+    if (wanted === 'whatsapp') candidates.push('whatsapp', 'email');
+    else if (wanted === 'email') candidates.push('email', 'whatsapp');
+    else candidates.push('whatsapp', 'email');
+  }
+
+  // Best case: connected and reachable.
+  for (const channel of candidates) {
+    const to = addressFor(channel);
+    if (to && status[channel].connected) return { channel, to, deliverable: true, reason: '' };
+  }
+  // Reachable but nothing is connected: name the channel so the refusal is
+  // recorded against it.
+  for (const channel of candidates) {
+    const to = addressFor(channel);
+    if (to) return { channel, to, deliverable: false, reason: status[channel].reason };
+  }
+  const first = candidates[0];
+  return {
+    channel: null, to: null, deliverable: false,
+    reason: `This contact has no ${first === 'email' ? 'email address' : 'phone number'} on file.`,
+  };
+}
+
+/**
+ * "Do not contact me automatically." Checked for every automated send; a person
+ * can still send an operational message by hand, which is the point of the flag.
+ */
+export function checkAutomatedSendAllowed(
+  orgId: string, leadId?: string | null,
+): { allowed: boolean; reason: string } {
+  if (!leadId) return { allowed: true, reason: '' };
+  const lead = get<{ messaging_opt_out: number; status: string }>(
+    'SELECT messaging_opt_out, status FROM leads WHERE id = ? AND org_id = ?', [leadId, orgId],
+  );
+  if (lead?.messaging_opt_out) {
+    return { allowed: false, reason: 'This contact has opted out of automatic messages.' };
+  }
+  return { allowed: true, reason: '' };
+}
+
 // --- templates ------------------------------------------------------------
 
 export interface SendTemplateInput {
   orgId: string;
   templateKey: string;
-  channel?: Channel;
+  /** A specific channel, or "preferred" to use the customer's own choice. */
+  channel?: Channel | 'preferred';
   leadId?: string | null;
   customerId?: string | null;
   quotationId?: string | null;
+  appointmentId?: string | null;
   userId?: string | null;
   automationRunId?: string | null;
   purpose?: 'operational' | 'marketing';
   attachments?: { filename: string; path: string }[];
+  /** Overrides the rendered body/subject, e.g. after the sender edited them. */
+  bodyOverride?: string | null;
+  subjectOverride?: string | null;
+}
+
+/** The rendered text of a template for one lead, for preview and editing. */
+export interface RenderedTemplate {
+  key: string;
+  name: string;
+  channel: Channel;
+  purpose: 'operational' | 'marketing';
+  subject: string | null;
+  body: string;
+}
+
+/** Renders a stored template against the lead/quote/appointment/company. */
+export function renderTemplate(
+  orgId: string, templateKey: string,
+  target: { leadId?: string | null; quotationId?: string | null; appointmentId?: string | null; userId?: string | null },
+): RenderedTemplate | null {
+  const template = get<any>('SELECT * FROM message_templates WHERE org_id = ? AND key = ? AND is_active = 1', [
+    orgId, templateKey,
+  ]);
+  if (!template) return null;
+  const ctx = templateContext(orgId, target);
+  return {
+    key: template.key,
+    name: template.name,
+    channel: template.channel as Channel,
+    purpose: template.purpose,
+    subject: template.subject ? render(template.subject, ctx) : null,
+    body: render(template.body, ctx),
+  };
+}
+
+function templateContext(
+  orgId: string,
+  target: { leadId?: string | null; quotationId?: string | null; appointmentId?: string | null; userId?: string | null },
+): Record<string, any> {
+  const org = get<any>('SELECT * FROM organizations WHERE id = ?', [orgId]);
+  const lead = target.leadId
+    ? get<any>('SELECT * FROM leads WHERE id = ? AND org_id = ?', [target.leadId, orgId])
+    : null;
+  const quotation = target.quotationId
+    ? get<any>('SELECT * FROM quotations WHERE id = ? AND org_id = ?', [target.quotationId, orgId])
+    : null;
+  const appointment = target.appointmentId
+    ? get<any>('SELECT * FROM appointments WHERE id = ? AND org_id = ?', [target.appointmentId, orgId])
+    : null;
+  const ownerId = target.userId ?? lead?.owner_id ?? null;
+  const user = ownerId
+    ? get<any>('SELECT * FROM users WHERE id = ? AND org_id = ?', [ownerId, orgId])
+    : null;
+  return { org, company: org, lead, quotation, quote: quotation, appointment, user };
 }
 
 /**
@@ -270,37 +434,34 @@ export async function sendTemplate(input: SendTemplateInput): Promise<SendResult
   if (!template) {
     return { sent: false, messageId: '', reason: `Template "${input.templateKey}" is not configured.` };
   }
-  const org = get<any>('SELECT * FROM organizations WHERE id = ?', [input.orgId]);
+  // Automated sends honour the contact's "do not contact me automatically" flag.
+  // A person sending by hand is not an automated send and is not blocked here.
+  if (input.automationRunId) {
+    const allowed = checkAutomatedSendAllowed(input.orgId, input.leadId);
+    if (!allowed.allowed) return { sent: false, messageId: '', reason: allowed.reason };
+  }
+
   const lead = input.leadId
     ? get<any>('SELECT * FROM leads WHERE id = ? AND org_id = ?', [input.leadId, input.orgId])
     : null;
-  const quotation = input.quotationId
-    ? get<any>('SELECT * FROM quotations WHERE id = ? AND org_id = ?', [input.quotationId, input.orgId])
-    : null;
-  const ownerId = input.userId ?? lead?.owner_id ?? null;
-  const user = ownerId
-    ? get<any>('SELECT * FROM users WHERE id = ? AND org_id = ?', [ownerId, input.orgId])
-    : null;
+  if (!lead) return { sent: false, messageId: '', reason: 'That lead no longer exists.' };
 
-  const channel = (input.channel ?? template.channel) as Channel;
-  const to = channel === 'email' ? lead?.email : lead?.phone;
-  if (!to) {
-    return {
-      sent: false, messageId: '',
-      reason: `The lead has no ${channel === 'email' ? 'email address' : 'phone number'} on file.`,
-    };
+  const requested = (input.channel ?? template.channel) as Channel | 'preferred';
+  const resolved = resolveChannel(input.orgId, lead, requested);
+  if (!resolved.channel || !resolved.to) {
+    return { sent: false, messageId: '', reason: resolved.reason };
   }
 
-  const ctx = { org, company: org, lead, quotation, quote: quotation, user };
+  const ctx = templateContext(input.orgId, input);
   return sendMessage({
     orgId: input.orgId,
-    channel,
+    channel: resolved.channel,
     leadId: input.leadId ?? null,
     customerId: input.customerId ?? null,
     quotationId: input.quotationId ?? null,
-    to,
-    subject: template.subject ? render(template.subject, ctx) : null,
-    body: render(template.body, ctx),
+    to: resolved.to,
+    subject: input.subjectOverride ?? (template.subject ? render(template.subject, ctx) : null),
+    body: input.bodyOverride ?? render(template.body, ctx),
     purpose: (input.purpose ?? template.purpose) as 'operational' | 'marketing',
     userId: input.userId ?? null,
     automationRunId: input.automationRunId ?? null,

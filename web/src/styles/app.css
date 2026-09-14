@@ -231,6 +231,9 @@ select { appearance: none; background-image: url("data:image/svg+xml;utf8,<svg x
 .check input { margin-top: 2px; flex: none; }
 
 .grid { display: grid; gap: 12px; }
+/* Record pages: a wide main column and a narrower side column. A class, not an
+   inline style, so the mobile breakpoint below can collapse it to one column. */
+.grid.split { grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); align-items: start; gap: 16px; }
 .grid.c2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .grid.c3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .grid.c4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -277,6 +280,7 @@ a.kpi:hover { border-color: var(--border-strong); text-decoration: none; }
 .badge.good { background: var(--good-soft); color: var(--good); }
 .badge.danger { background: var(--danger-soft); color: var(--danger); }
 .badge.accent { background: var(--accent-soft); color: var(--accent-ink); }
+.badge.info { background: var(--cold-soft); color: var(--cold); }
 .badge.outline { background: transparent; border: 1px solid var(--border-strong); }
 .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: currentColor; }
 
@@ -362,6 +366,17 @@ table.data td.num, table.data th.num { text-align: right; font-variant-numeric: 
 /* ---------- attention list ---------- */
 
 .attention-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(330px, 100%), 1fr)); }
+
+/* One row of the "what needs you now" list: mark, text, money, and the button
+   that does the thing. The text is its own button so the row stays clickable. */
+.action-row { align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
+.action-row:last-child { border-bottom: 0; }
+.action-row .action-row-main:hover .strong { color: var(--accent-ink); }
+@media (max-width: 720px) {
+  .action-row { flex-wrap: wrap; }
+  .action-row .right { text-align: left; }
+  .action-row > .btn { width: 100%; justify-content: center; }
+}
 .attention-group { border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); min-width: 0; }
 
 .attention-item {
@@ -538,7 +553,7 @@ table.data td.num, table.data th.num { text-align: right; font-variant-numeric: 
   .main { padding-bottom: 62px; }
   .page { padding: 14px 12px; }
   .page-head { margin-bottom: 14px; }
-  .grid.c2, .grid.c3, .grid.c4 { grid-template-columns: minmax(0, 1fr); }
+  .grid.c2, .grid.c3, .grid.c4, .grid.split { grid-template-columns: minmax(0, 1fr); }
   .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .kpi-value { font-size: 20px; }
   .board-col { flex-basis: 84vw; width: 84vw; max-height: none; }

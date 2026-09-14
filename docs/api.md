@@ -242,10 +242,44 @@ you sent it yourself and starts the follow-up sequence.
 
 ```http
 GET/POST/PATCH /api/surveys       site surveys with per-project-type checklists
+GET  /api/surveys/:id/quotation-draft   the pre-filled quotation for a completed survey
 GET/POST/DELETE /api/documents    uploads (type and size checked, random storage names)
 GET/POST/PATCH /api/customers
 GET/POST/PATCH /api/projects      the post-sale installation record
 ```
+
+`quotation-draft` reads the survey and returns quotation lines: quantities from
+what the technician measured, prices from **your own price list**. Nothing is
+written — the owner reviews it in the builder and creates the quotation
+themselves. A line the survey could not size comes back with
+`needs_review: true` and the reason, and `missing[]` lists what to go back for.
+Sending `survey_id` on `POST /quotations` records which survey a quotation came
+from; a second quotation for the same survey is always allowed.
+
+### Appointments
+
+```http
+GET   /api/appointments     ?from=&to=&lead_id=&status=
+POST  /api/appointments     { type, title, starts_at, ends_at?, lead_id?, technician_id?,
+                              location?, notify_customer?, allow_conflict? }
+PATCH /api/appointments/:id { starts_at? | status?, outcome_note?, notify_customer?, allow_conflict? }
+GET   /api/calendar         ?from=&to=   appointments, tasks and quotation deadlines
+```
+
+Types: `site_survey`, `sales_meeting`, `call`, `installation`, `service`, `other`.
+Statuses: `scheduled`, `completed`, `cancelled`, `no_show`.
+
+- **Double bookings are refused.** An overlap for the same technician or assignee
+  returns `409 conflict` with `details.conflicts[]` naming what is already booked.
+  Send `allow_conflict: true` to book it anyway once the person has seen the clash.
+- **`notify_customer` tells you what actually happened.** The response carries
+  `notification: { sent, channel?, reason? }`. A confirmation that could not go
+  out says so; `confirmation_sent_at` is set **only** when a provider accepted it.
+- A `site_survey` creates its on-site checklist, moves the lead to the survey
+  stage, and stops the chasing sequences.
+- Rescheduling moves the linked survey and its task, and clears the reminder so it
+  is sent again for the new date. Cancelling closes the survey and stops any
+  reminder still queued.
 
 ### Analytics
 
@@ -259,6 +293,33 @@ GET /api/analytics/team       per-salesperson performance, response time, overdu
 GET /api/analytics/forecast   weighted pipeline by stage probability
 GET /api/analytics/recovery   lost leads worth going back to
 ```
+
+### Dashboard
+
+```http
+GET /api/dashboard
+```
+
+Returns the KPIs, the pipeline breakdown, the next 48 hours — and `attention`, a
+single ranked list of what to do now. Each entry is enough to act on without
+another request:
+
+```json
+{
+  "id": "survey:srv_…", "kind": "survey_to_quote", "priority": 1,
+  "name": "Nikos Antoniou", "reason": "Survey completed, no quotation yet",
+  "context": "10.8 kWp photovoltaic system · surveyed 2 days ago",
+  "value": 14500, "action": "create_quote", "action_label": "Create quotation",
+  "link": "/app/surveys/srv_…", "lead_id": "led_…", "survey_id": "srv_…"
+}
+```
+
+Kinds: `overdue_task`, `appointment_missed`, `hot_lead`, `survey_to_quote`,
+`quote_viewed`, `quote_awaiting`, `appointment_upcoming`, `no_next_action`,
+`unassigned`, `idle_lead`, `installation_due`, `recovery_due`. Priority 1 is
+today's work; the list is sorted by priority then by the money at stake. It is
+built from the existing score, stage, next-action date, quotation status, survey
+status and appointment status — there is no second scoring system.
 
 ### Automations
 
@@ -315,15 +376,65 @@ accountant needs. Both the export and the erasure are themselves audited.
 ### Messages and notifications
 
 ```http
-GET  /api/messages/channels    which channels are actually connected
+GET  /api/messages/channels    ?lead_id=   which channels work, and for this contact
+GET  /api/messages/templates   ?lead_id=&quotation_id=&appointment_id=
 GET  /api/messages             ?lead=
-POST /api/messages/send        { lead_id, channel, template_key? | body, subject? }
+POST /api/messages/send        { lead_id, channel, body, subject?, purpose? }
 POST /api/messages/call        { lead_id }  click-to-call, logs the attempt
 POST /api/messages/inbound     provider webhook for replies
 GET  /api/notifications        ?unread=
 POST /api/notifications/read   { ids? }     omit ids to mark all read
 GET  /api/notifications/preferences
 ```
+
+`GET /channels` with a `lead_id` answers three questions at once: which providers
+are connected, whether this contact is reachable on each, and which channel their
+stated preference resolves to.
+
+```json
+{
+  "channels": [
+    { "key": "whatsapp", "label": "WhatsApp", "connected": false, "reachable": true,
+      "address": "+30 694 123 4567", "hint": "WhatsApp is not connected…",
+      "setup_path": "/app/settings/integrations" },
+    { "key": "sms", "connected": false, "status": "unavailable",
+      "hint": "SMS is not available yet — no SMS provider is implemented in VoltaFlow." }
+  ],
+  "preferred": "whatsapp",
+  "stated_preference": "whatsapp",
+  "opted_out": false
+}
+```
+
+**SMS is always reported as unavailable.** No SMS provider is implemented, and a
+disabled button that implies otherwise would be worse than saying so.
+
+`GET /templates` returns every active template **already rendered against this
+lead** — real names, real quotation numbers, real appointment times, no
+`{{placeholders}}`. The composer shows the result and the sender edits it before
+sending, which keeps template logic and company data on the server.
+
+```json
+{ "templates": [
+  { "key": "survey_confirmation", "name": "Site survey confirmation", "channel": "email",
+    "purpose": "operational", "subject": "Site survey confirmed — 15/09/2026, 10:00",
+    "body": "Hello Nikos,\n\nYour technical site survey is confirmed for…" }
+] }
+```
+
+### Consent and automatic messages
+
+```http
+POST /api/leads/:id/messaging-opt-out    { opted_out: true | false }
+POST /api/leads/:id/automation           { paused: true | false }
+POST /api/leads/:id/automation/:runId/stop
+```
+
+`messaging-opt-out` is "do not contact me automatically". It blocks every
+automated send for that contact, stops whatever sequences are running (returning
+how many), and is written to the audit log. A person can still send an
+operational message by hand — that is the point of the flag, and why it is
+separate from marketing consent.
 
 A send to a channel that is not connected returns `not_configured`, writes the
 message with status `blocked` and the reason, and the lead timeline shows it as

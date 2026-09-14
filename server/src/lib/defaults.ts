@@ -139,6 +139,122 @@ Our technician will need access to the roof area and the electrical panel. The v
 Kind regards,
 {{company.name}}`,
   },
+  {
+    key: 'survey_reminder',
+    name: 'Site survey reminder',
+    channel: 'whatsapp',
+    purpose: 'operational',
+    subject: null,
+    body: `Hello {{lead.first_name}}, a reminder that our technician is visiting tomorrow, {{appointment.date}}, for your site survey.
+
+Please make sure we can reach the roof area and the electrical panel. If the time no longer suits you, reply to this message and we will move it.
+
+{{company.name}} — {{company.phone}}`,
+  },
+  {
+    key: 'appointment_confirmation',
+    name: 'Appointment confirmation',
+    channel: 'email',
+    purpose: 'operational',
+    subject: 'Appointment confirmed — {{appointment.date}}',
+    body: `Hello {{lead.first_name}},
+
+Your appointment with us is confirmed:
+
+{{appointment.title}}
+{{appointment.date}}
+{{appointment.location}}
+
+If you need to change the time, just reply to this message or call us on {{company.phone}}.
+
+Kind regards,
+{{company.name}}`,
+  },
+  {
+    key: 'appointment_reminder',
+    name: 'Appointment reminder',
+    channel: 'whatsapp',
+    purpose: 'operational',
+    subject: null,
+    body: `Hello {{lead.first_name}}, a reminder of your appointment with {{company.name}} tomorrow: {{appointment.title}}, {{appointment.date}}{{appointment.location}}.
+
+Reply to this message if the time no longer suits you.`,
+  },
+  {
+    key: 'appointment_rescheduled',
+    name: 'Appointment moved',
+    channel: 'email',
+    purpose: 'operational',
+    subject: 'Your appointment has been moved — {{appointment.date}}',
+    body: `Hello {{lead.first_name}},
+
+Your appointment has been moved to {{appointment.date}}.
+
+{{appointment.title}}
+{{appointment.location}}
+
+Apologies for the change. Call us on {{company.phone}} if that time does not suit you.
+
+Kind regards,
+{{company.name}}`,
+  },
+  {
+    key: 'appointment_cancelled',
+    name: 'Appointment cancelled',
+    channel: 'email',
+    purpose: 'operational',
+    subject: 'Your appointment has been cancelled',
+    body: `Hello {{lead.first_name}},
+
+We have cancelled the appointment that was booked for {{appointment.date}}.
+
+Please call us on {{company.phone}} and we will arrange a new time that works for you.
+
+Kind regards,
+{{company.name}}`,
+  },
+  {
+    key: 'installation_confirmation',
+    name: 'Installation confirmed',
+    channel: 'email',
+    purpose: 'operational',
+    subject: 'Your installation is booked — {{appointment.date}}',
+    body: `Hello {{lead.first_name}},
+
+Your installation is booked for {{appointment.date}} at {{appointment.location}}.
+
+Our team will need access to the roof area and the electrical panel, and the supply will be off for a short period during the works.
+
+If anything needs to change, call us on {{company.phone}}.
+
+Kind regards,
+{{company.name}}`,
+  },
+  {
+    key: 'post_installation_follow_up',
+    name: 'After the installation',
+    channel: 'email',
+    purpose: 'operational',
+    subject: 'How is your system performing?',
+    body: `Hello {{lead.first_name}},
+
+Your system has been running for a few weeks now. We wanted to check that everything is working as expected and answer any questions about the monitoring or the paperwork.
+
+If anything is not right, reply to this message or call us on {{company.phone}} and we will arrange a visit.
+
+Kind regards,
+{{company.name}}`,
+  },
+  {
+    key: 'first_contact',
+    name: 'First contact attempt',
+    channel: 'whatsapp',
+    purpose: 'operational',
+    subject: null,
+    body: `Hello {{lead.first_name}}, this is {{user.first_name}} from {{company.name}} about your enquiry for {{lead.project_summary}}.
+
+I tried to reach you by phone. When is a good time to call you back? Happy to answer anything by message as well.`,
+  },
 ] as const;
 
 /** The eight automation rules from the product spec, created active by default. */
@@ -250,6 +366,80 @@ export const DEFAULT_AUTOMATION_RULES = [
       { type: 'notify_owner', notification_type: 'no_next_action', severity: 'warning', title: 'Lead has no next action', body: '{{lead.full_name}} is open but nothing is scheduled.' },
     ] }],
     stop_on: ['won', 'lost'],
+  },
+  {
+    key: 'appointment_reminder',
+    name: 'Appointment reminder — message the customer the day before',
+    description: 'The evening before a booked visit the customer gets one reminder on their preferred channel. Nothing is sent if no channel is connected, if the customer has opted out, or if the appointment was cancelled.',
+    trigger_type: 'appointment_reminder_due',
+    steps: [{ delay_minutes: 0, actions: [
+      { type: 'send_template', template_key: 'appointment_reminder', channel: 'preferred', purpose: 'operational' },
+    ] }],
+    stop_on: ['lost', 'paused', 'opted_out'],
+  },
+] as const;
+
+/**
+ * Customer-facing follow-up sequences. These send real messages, so they ship
+ * switched OFF: an installer turns them on in Automation once a channel is
+ * connected and they are happy with the wording. The task-based sequences above
+ * are what runs by default — a salesperson is reminded, the customer is not
+ * messaged automatically until someone decides they should be.
+ */
+export const OPTIONAL_AUTOMATION_RULES = [
+  {
+    key: 'new_lead_messages',
+    name: 'New lead — message the customer on day 1, 3, 7 and 14',
+    description: 'Sends the customer a follow-up message on their preferred channel until they answer. Stops the moment they reply, a visit is booked, or the deal is won or lost.',
+    trigger_type: 'lead_created',
+    steps: [
+      { delay_minutes: 1440, stop_if: ['customer_replied', 'appointment_booked'], actions: [
+        { type: 'send_template', template_key: 'first_contact', channel: 'preferred', purpose: 'operational' },
+      ] },
+      { delay_minutes: 4320, stop_if: ['customer_replied', 'appointment_booked'], actions: [
+        { type: 'send_template', template_key: 'first_contact', channel: 'preferred', purpose: 'operational' },
+      ] },
+      { delay_minutes: 10080, stop_if: ['customer_replied', 'appointment_booked'], actions: [
+        { type: 'send_template', template_key: 'first_contact', channel: 'preferred', purpose: 'operational' },
+      ] },
+      { delay_minutes: 20160, stop_if: ['customer_replied', 'appointment_booked'], actions: [
+        { type: 'send_template', template_key: 'first_contact', channel: 'preferred', purpose: 'operational' },
+      ] },
+    ],
+    stop_on: ['customer_replied', 'appointment_booked', 'won', 'lost', 'paused', 'opted_out'],
+  },
+  {
+    key: 'quote_follow_up_messages',
+    name: 'Quotation sent — message the customer on day 2, 5, 10 and 20',
+    description: 'Chases an unanswered quotation on the customer\u2019s preferred channel. Stops as soon as they accept, decline or reply.',
+    trigger_type: 'quote_sent',
+    steps: [
+      { delay_minutes: 2880, stop_if: ['customer_replied', 'quote_responded'], actions: [
+        { type: 'send_template', template_key: 'quote_follow_up', channel: 'preferred', purpose: 'operational' },
+      ] },
+      { delay_minutes: 7200, stop_if: ['customer_replied', 'quote_responded'], actions: [
+        { type: 'send_template', template_key: 'quote_follow_up', channel: 'preferred', purpose: 'operational' },
+      ] },
+      { delay_minutes: 14400, stop_if: ['customer_replied', 'quote_responded'], actions: [
+        { type: 'send_template', template_key: 'quote_follow_up', channel: 'preferred', purpose: 'operational' },
+      ] },
+      { delay_minutes: 28800, stop_if: ['customer_replied', 'quote_responded'], actions: [
+        { type: 'send_template', template_key: 'quote_follow_up', channel: 'preferred', purpose: 'operational' },
+      ] },
+    ],
+    stop_on: ['customer_replied', 'quote_responded', 'won', 'lost', 'paused', 'opted_out'],
+  },
+  {
+    key: 'post_installation',
+    name: 'Installation completed — check in three weeks later',
+    description: 'One message after the installation asking whether everything is working. Off by default.',
+    trigger_type: 'installation_completed',
+    steps: [
+      { delay_minutes: 30240, actions: [
+        { type: 'send_template', template_key: 'post_installation_follow_up', channel: 'preferred', purpose: 'operational' },
+      ] },
+    ],
+    stop_on: ['paused', 'opted_out'],
   },
 ] as const;
 

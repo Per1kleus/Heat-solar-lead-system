@@ -12,13 +12,16 @@ process.env.VF_JWT_SECRET = 'test-secret-not-used-in-production';
 process.env.NODE_ENV = 'test';
 
 const { applySchema, all, get, run } = await import('../src/lib/db.ts');
-const { registerAutomationEngine, processDueRuns } = await import('../src/lib/automation.ts');
+const { registerAutomationEngine, processDueRuns, stopAllRuns, stopRun } = await import('../src/lib/automation.ts');
+const { buildAttentionList } = await import('../src/lib/attention.ts');
+const { emit } = await import('../src/lib/events.ts');
 const { provisionOrganization } = await import('../src/lib/provision.ts');
 const {
   createLead, findDuplicates, normalizePhone, dedupeKeyFor, rescoreLead, markLost, markWon,
   moveStage, logActivity, recomputeNextAction, loadLead, shapeLead,
 } = await import('../src/lib/leads.ts');
 const { computeScore, gatherSignals, loadRules, countCompleteness } = await import('../src/lib/scoring.ts');
+const { DEFAULT_TEMPLATES } = await import('../src/lib/defaults.ts');
 const { computeTotals, createQuotation, markSent, setQuotationStatus } = await import('../src/lib/quotations.ts');
 const { createTask, completeTask } = await import('../src/lib/tasks.ts');
 const { renderQuotationPdf } = await import('../src/lib/pdf.ts');
@@ -26,7 +29,14 @@ const { getSubscription, assertLeadAllowance } = await import('../src/lib/billin
 const { render, projectSummary } = await import('../src/lib/render.ts');
 const { hashPassword, verifyPassword } = await import('../src/lib/auth.ts');
 const { can, seesEverything } = await import('../src/lib/permissions.ts');
-const { checkMarketingConsent, getIntegration } = await import('../src/lib/messaging.ts');
+const {
+  checkMarketingConsent, getIntegration, channelStatus, resolveChannel, renderTemplate,
+  sendTemplate, checkAutomatedSendAllowed,
+} = await import('../src/lib/messaging.ts');
+const { buildQuotationDraft } = await import('../src/lib/quoteDraft.ts');
+const { findApptConflicts } = await import('../src/routes/tasks.ts');
+const { newId } = await import('../src/lib/ids.ts');
+const { nowIso } = await import('../src/lib/time.ts');
 
 applySchema();
 registerAutomationEngine();
@@ -64,9 +74,19 @@ describe('organisation provisioning', () => {
 
     assert.equal(all('SELECT 1 FROM lead_sources WHERE org_id = ?', [orgA]).length, 11);
     assert.equal(all('SELECT 1 FROM lost_reasons WHERE org_id = ?', [orgA]).length, 8);
-    assert.equal(all('SELECT 1 FROM automation_rules WHERE org_id = ? AND is_active = 1', [orgA]).length, 8);
+    // Nine rules run out of the box: the eight from the spec plus the appointment
+    // reminder. The customer-messaging sequences ship switched off.
+    assert.equal(all('SELECT 1 FROM automation_rules WHERE org_id = ? AND is_active = 1', [orgA]).length, 9);
+    assert.equal(all('SELECT 1 FROM automation_rules WHERE org_id = ? AND is_active = 0', [orgA]).length, 3);
     assert.ok(all('SELECT 1 FROM product_templates WHERE org_id = ?', [orgA]).length > 15);
-    assert.equal(all('SELECT 1 FROM message_templates WHERE org_id = ?', [orgA]).length, 4);
+    assert.equal(all('SELECT 1 FROM message_templates WHERE org_id = ?', [orgA]).length, DEFAULT_TEMPLATES.length);
+    // Every template an automation rule sends must actually exist.
+    for (const key of ['appointment_reminder', 'appointment_confirmation', 'survey_reminder', 'first_contact']) {
+      assert.ok(
+        get('SELECT 1 FROM message_templates WHERE org_id = ? AND key = ?', [orgA, key]),
+        `template ${key} should be provisioned`,
+      );
+    }
   });
 
   test('every integration starts disconnected', () => {
@@ -699,5 +719,468 @@ describe('audit trail', () => {
     for (const expected of ['org.created', 'lead.created', 'quote.created', 'lead.won', 'lead.lost', 'quote.sent']) {
       assert.ok(actions.includes(expected), `expected an audit entry for ${expected}, got ${actions.join(', ')}`);
     }
+  });
+});
+
+// ------------------------------------------------- unified customer messaging
+
+describe('customer messaging', () => {
+  test('the channel follows the customer preference and says why it cannot deliver', () => {
+    // Nothing is connected in the test organisation, so nothing is deliverable —
+    // but the channel is still named so the attempt can be recorded against it.
+    const prefersWhatsApp = resolveChannel(orgA, {
+      preferred_contact: 'whatsapp', phone: '+30 691 111 2222', email: 'x@test.gr',
+    }, 'preferred');
+    assert.equal(prefersWhatsApp.channel, 'whatsapp');
+    assert.equal(prefersWhatsApp.deliverable, false);
+    assert.match(prefersWhatsApp.reason, /not connected/i);
+
+    const prefersEmail = resolveChannel(orgA, {
+      preferred_contact: 'email', phone: '+30 691 111 2222', email: 'x@test.gr',
+    }, 'preferred');
+    assert.equal(prefersEmail.channel, 'email');
+
+    // An explicit channel wins over the preference.
+    assert.equal(resolveChannel(orgA, { preferred_contact: 'whatsapp', email: 'x@test.gr' }, 'email').channel, 'email');
+
+    // No address at all: nothing to attempt.
+    const unreachable = resolveChannel(orgA, { preferred_contact: 'email', phone: null, email: null }, 'preferred');
+    assert.equal(unreachable.channel, null);
+    assert.match(unreachable.reason, /no (email address|phone number)/i);
+  });
+
+  test('SMS is reported as unavailable rather than offered', () => {
+    const status = channelStatus(orgA);
+    assert.equal(status.sms.connected, false);
+    assert.match(status.sms.reason, /not available/i);
+    // Click-to-call always works from the device, with or without a provider.
+    assert.equal(status.phone.connected, true);
+  });
+
+  test('an unsendable template records the attempt so the timeline is honest', async () => {
+    const { lead } = createLead(
+      {
+        first_name: 'Honest', last_name: 'Timeline', phone: '+30 691 222 0001', email: 'honest@test.gr',
+        project_types: ['pv'],
+      },
+      { orgId: orgA, userId: userA, skipAutomation: true, allowDuplicate: true },
+    );
+    const result = await sendTemplate({
+      orgId: orgA, templateKey: 'lead_acknowledgement', channel: 'email', leadId: lead.id, userId: userA,
+    });
+    assert.equal(result.sent, false);
+    assert.match(result.reason ?? '', /not connected/i);
+
+    const message = get<any>(
+      "SELECT * FROM messages WHERE org_id = ? AND lead_id = ? ORDER BY created_at DESC LIMIT 1", [orgA, lead.id],
+    );
+    assert.ok(message, 'the attempt must be recorded');
+    assert.equal(message.status, 'blocked');
+    assert.equal(message.sent_at, null);
+    const activity = get<any>(
+      "SELECT * FROM activities WHERE org_id = ? AND lead_id = ? AND type = 'email' ORDER BY occurred_at DESC LIMIT 1",
+      [orgA, lead.id],
+    );
+    assert.match(activity.title, /NOT sent/);
+  });
+
+  test('a rendered template carries real values, never placeholders', () => {
+    const lead = get<any>("SELECT * FROM leads WHERE org_id = ? AND first_name = 'Honest'", [orgA]);
+    const rendered = renderTemplate(orgA, 'lead_acknowledgement', { leadId: lead.id, userId: userA });
+    assert.ok(rendered);
+    assert.match(rendered!.body, /Hello Honest/);
+    assert.ok(!rendered!.body.includes('{{'), 'no placeholder should survive rendering');
+    assert.ok(!rendered!.subject?.includes('{{'));
+  });
+
+  test('an opted-out contact blocks automated sends but not a person', async () => {
+    const { lead } = createLead(
+      {
+        first_name: 'Optout', last_name: 'Person', phone: '+30 691 222 0002', email: 'opt@test.gr',
+        project_types: ['pv'],
+      },
+      { orgId: orgA, userId: userA, skipAutomation: true, allowDuplicate: true },
+    );
+    run('UPDATE leads SET messaging_opt_out = 1 WHERE id = ?', [lead.id]);
+
+    assert.equal(checkAutomatedSendAllowed(orgA, lead.id).allowed, false);
+
+    // An automated send (it carries a run id) is refused outright.
+    const automated = await sendTemplate({
+      orgId: orgA, templateKey: 'lead_acknowledgement', leadId: lead.id, automationRunId: 'run_test',
+    });
+    assert.equal(automated.sent, false);
+    assert.match(automated.reason ?? '', /opted out/i);
+    assert.equal(
+      get<{ n: number }>('SELECT COUNT(*) AS n FROM messages WHERE lead_id = ?', [lead.id])?.n, 0,
+      'a refused automated send must not create a message row',
+    );
+
+    // A person sending by hand is still allowed; it just cannot be delivered
+    // because nothing is connected.
+    const manual = await sendTemplate({
+      orgId: orgA, templateKey: 'lead_acknowledgement', leadId: lead.id, userId: userA,
+    });
+    assert.equal(manual.sent, false);
+    assert.match(manual.reason ?? '', /not connected/i);
+    assert.equal(get<{ n: number }>('SELECT COUNT(*) AS n FROM messages WHERE lead_id = ?', [lead.id])?.n, 1);
+  });
+
+  test('templates never cross a tenant boundary', () => {
+    const leadB = get<any>('SELECT id FROM leads WHERE org_id = ? LIMIT 1', [orgB]);
+    if (leadB) {
+      assert.equal(renderTemplate(orgA, 'lead_acknowledgement', { leadId: leadB.id })!.body.includes('undefined'), false);
+    }
+    // Organisation B has its own template rows; A's id is never returned for B.
+    const a = get<any>('SELECT id FROM message_templates WHERE org_id = ? AND key = ?', [orgA, 'quote_sent']);
+    const b = get<any>('SELECT id FROM message_templates WHERE org_id = ? AND key = ?', [orgB, 'quote_sent']);
+    assert.ok(a && b && a.id !== b.id);
+  });
+});
+
+// --------------------------------------------------------- appointments
+
+describe('appointment scheduling', () => {
+  let apptLead = '';
+
+  before(() => {
+    const { lead } = createLead(
+      {
+        first_name: 'Appointment', last_name: 'Customer', phone: '+30 691 333 0001',
+        email: 'appt@test.gr', project_types: ['pv'], address: 'Roof street 1', city: 'Volos',
+      },
+      { orgId: orgA, userId: userA, skipAutomation: true, allowDuplicate: true },
+    );
+    apptLead = lead.id;
+  });
+
+  const book = (startsAt: string, minutes = 60, technicianId: string | null = userA) => {
+    const id = newId('apt');
+    const now = nowIso();
+    run(
+      `INSERT INTO appointments (id, org_id, lead_id, type, title, starts_at, ends_at, location,
+         assignee_id, technician_id, status, created_by, created_at, updated_at)
+       VALUES (?,?,?, 'site_survey', 'Site survey', ?,?, 'Roof street 1', ?,?, 'scheduled', ?,?,?)`,
+      [
+        id, orgA, apptLead, startsAt,
+        new Date(new Date(startsAt).getTime() + minutes * 60_000).toISOString(),
+        userA, technicianId, userA, now, now,
+      ],
+    );
+    return id;
+  };
+
+  test('a double booking for the same person is detected', () => {
+    const start = new Date(Date.now() + 3 * 86_400_000);
+    start.setHours(10, 0, 0, 0);
+    book(start.toISOString(), 120);
+
+    // Overlaps the middle of the existing visit.
+    const overlapStart = new Date(start.getTime() + 60 * 60_000);
+    const clash = findApptConflicts(
+      orgA, overlapStart, new Date(overlapStart.getTime() + 60 * 60_000), [userA],
+    );
+    assert.equal(clash.length, 1);
+    assert.match(clash[0].title, /Site survey/);
+
+    // Directly after it is fine — end and start may touch.
+    const after = new Date(start.getTime() + 120 * 60_000);
+    assert.equal(findApptConflicts(orgA, after, new Date(after.getTime() + 3_600_000), [userA]).length, 0);
+
+    // Somebody else at the same time is fine.
+    assert.equal(findApptConflicts(orgA, overlapStart, new Date(overlapStart.getTime() + 3_600_000), [userB]).length, 0);
+  });
+
+  test('a conflict check never sees another company’s diary', () => {
+    const start = new Date(Date.now() + 5 * 86_400_000);
+    start.setHours(9, 0, 0, 0);
+    book(start.toISOString(), 60);
+    assert.equal(findApptConflicts(orgB, start, new Date(start.getTime() + 3_600_000), [userA]).length, 0);
+  });
+});
+
+// ------------------------------------------------- survey → quotation
+
+describe('survey to quotation', () => {
+  let surveyLead = '';
+  let fullSurvey = '';
+  let thinSurvey = '';
+
+  before(() => {
+    const { lead } = createLead(
+      {
+        first_name: 'Survey', last_name: 'Quote', phone: '+30 691 444 0001', email: 'sq@test.gr',
+        project_types: ['pv', 'battery'], address: 'Sunny street 4', city: 'Larissa',
+      },
+      { orgId: orgA, userId: userA, skipAutomation: true, allowDuplicate: true },
+    );
+    surveyLead = lead.id;
+    const now = nowIso();
+
+    fullSurvey = newId('srv');
+    run(
+      `INSERT INTO site_surveys (id, org_id, lead_id, project_type, status, completed_at, address,
+         findings, recommended_system, technical_notes, feasible, created_at, updated_at)
+       VALUES (?,?,?, 'pv', 'completed', ?, 'Sunny street 4', ?, ?, ?, 1, ?, ?)`,
+      [
+        fullSurvey, orgA, surveyLead, now,
+        JSON.stringify({
+          module_count: 24, system_kwp: 10.8, roof_type: 'Tile', supply_phase: 'Three phase',
+          distance_to_panel_m: 18, battery_space: true,
+        }),
+        '10.8 kWp photovoltaic system with 10 kWh battery',
+        'South-facing tiled roof, no shading.',
+        now, now,
+      ],
+    );
+
+    thinSurvey = newId('srv');
+    run(
+      `INSERT INTO site_surveys (id, org_id, lead_id, project_type, status, completed_at, address,
+         findings, created_at, updated_at)
+       VALUES (?,?,?, 'pv', 'completed', ?, 'Sunny street 4', '{}', ?, ?)`,
+      [thinSurvey, orgA, surveyLead, now, now, now],
+    );
+  });
+
+  test('a complete survey pre-fills quantities from what was measured', () => {
+    const draft = buildQuotationDraft(orgA, fullSurvey);
+    assert.equal(draft.title, '10.8 kWp photovoltaic system with 10 kWh battery');
+    assert.equal(draft.lead_id, surveyLead);
+
+    const modules = draft.items.find((i) => i.name.startsWith('PV module'));
+    assert.ok(modules, 'the array should be on the quotation');
+    assert.equal(modules!.quantity, 24, 'the measured module count is used');
+    assert.equal(modules!.needs_review, false);
+
+    // Prices come from the company's own price list, never from the survey.
+    const product = get<{ unit_price: number }>(
+      'SELECT unit_price FROM product_templates WHERE org_id = ? AND name = ?',
+      [orgA, 'PV module 450 Wp (monocrystalline)'],
+    );
+    assert.equal(modules!.unit_price, product!.unit_price);
+
+    // Per-kWp lines use the surveyed system size.
+    const install = draft.items.find((i) => i.name === 'Mechanical installation');
+    assert.equal(install!.quantity, 10.8);
+
+    // The battery the technician found space for rides along as optional.
+    const battery = draft.items.find((i) => i.name.startsWith('LFP battery'));
+    assert.ok(battery && battery.is_optional, 'the battery should be an optional extra');
+
+    assert.equal(draft.missing.length, 0, 'a complete survey leaves nothing to chase');
+  });
+
+  test('a thin survey flags what is missing instead of guessing', () => {
+    const draft = buildQuotationDraft(orgA, thinSurvey);
+    const modules = draft.items.find((i) => i.name.startsWith('PV module'));
+    assert.ok(modules!.needs_review, 'an unmeasured quantity must be flagged');
+    assert.match(modules!.review_reason ?? '', /does not record/i);
+    assert.ok(draft.missing.length >= 3, 'the owner should be told what to go back for');
+    assert.ok(draft.missing.some((m) => /modules/i.test(m)));
+    assert.ok(draft.missing.some((m) => /kWp/i.test(m)));
+    // Nothing is invented: every price still comes from the price list.
+    for (const item of draft.items) {
+      assert.ok(item.unit_price > 0, `${item.name} should carry a real price`);
+      assert.ok(item.product_template_id, `${item.name} should point at a catalogue entry`);
+    }
+  });
+
+  test('a heat-pump survey produces heat-pump lines', () => {
+    const id = newId('srv');
+    const now = nowIso();
+    run(
+      `INSERT INTO site_surveys (id, org_id, lead_id, project_type, status, completed_at,
+         findings, created_at, updated_at)
+       VALUES (?,?,?, 'heat_pump', 'completed', ?, ?, ?, ?)`,
+      [
+        id, orgA, surveyLead, now,
+        JSON.stringify({ heat_loss_kw: 11, emitters: 'Radiators', removal_required: true, dhw_cylinder_space: true }),
+        now, now,
+      ],
+    );
+    const draft = buildQuotationDraft(orgA, id);
+    assert.ok(draft.items.some((i) => i.name.includes('heat pump')));
+    assert.ok(draft.items.some((i) => i.name.includes('Removal of existing boiler')));
+    assert.ok(draft.items.some((i) => i.name.includes('DHW cylinder')));
+    assert.ok(!draft.items.some((i) => i.name.startsWith('PV module')), 'no PV lines on a heat-pump survey');
+  });
+
+  test('a survey from another company is not readable', () => {
+    assert.throws(() => buildQuotationDraft(orgB, fullSurvey), /no longer exists/);
+  });
+
+  test('a second quotation for the same lead is still possible', () => {
+    const draft = buildQuotationDraft(orgA, fullSurvey);
+    const items = draft.items.map((item) => ({
+      name: item.name, quantity: item.quantity, unit: item.unit,
+      unit_price: item.unit_price, is_optional: item.is_optional, category: item.category,
+    }));
+    const first = createQuotation({
+      orgId: orgA, userId: userA, leadId: surveyLead, surveyId: fullSurvey,
+      title: draft.title, items,
+    });
+    const second = createQuotation({
+      orgId: orgA, userId: userA, leadId: surveyLead, surveyId: fullSurvey,
+      title: draft.title, items,
+    });
+    assert.notEqual(first.id, second.id, 'an identical second quotation must be created, not replayed');
+    assert.notEqual(first.number, second.number);
+    assert.equal(first.survey_id, fullSurvey, 'the quotation remembers which survey it came from');
+  });
+});
+
+// ------------------------------------------------ automation ↔ messaging
+
+describe('automated follow-ups', () => {
+  test('a lead is enrolled in a rule once, however often the trigger fires', () => {
+    const { lead } = createLead(
+      {
+        first_name: 'Enrol', last_name: 'Once', phone: '+30 691 555 0001', email: 'enrol@test.gr',
+        project_types: ['pv'],
+      },
+      { orgId: orgA, userId: userA, allowDuplicate: true },
+    );
+    const countRuns = () => get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM automation_runs r JOIN automation_rules ar ON ar.id = r.rule_id
+       WHERE r.org_id = ? AND r.lead_id = ? AND ar.key = 'new_lead'`,
+      [orgA, lead.id],
+    )?.n ?? 0;
+    assert.equal(countRuns(), 1);
+
+    // Re-firing the same trigger must not start a second chain of tasks.
+    emit({ type: 'lead_created', orgId: orgA, leadId: lead.id });
+    emit({ type: 'lead_created', orgId: orgA, leadId: lead.id });
+    assert.equal(countRuns(), 1, 'the run key must keep this to one enrolment');
+  });
+
+  test('an opted-out contact stops every running sequence', () => {
+    const { lead } = createLead(
+      {
+        first_name: 'Stop', last_name: 'Everything', phone: '+30 691 555 0002', email: 'stop@test.gr',
+        project_types: ['pv'],
+      },
+      { orgId: orgA, userId: userA, allowDuplicate: true },
+    );
+    assert.ok(
+      get<{ n: number }>("SELECT COUNT(*) AS n FROM automation_runs WHERE lead_id = ? AND status = 'active'", [lead.id])!.n > 0,
+    );
+    const stopped = stopAllRuns(orgA, lead.id, 'opted_out');
+    assert.ok(stopped >= 1);
+    const remaining = get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM automation_runs WHERE lead_id = ? AND status = 'active'", [lead.id],
+    )!.n;
+    assert.equal(remaining, 0, 'an opt-out overrides whatever the rule was configured to ignore');
+    const reason = get<{ stopped_reason: string }>(
+      'SELECT stopped_reason FROM automation_runs WHERE lead_id = ? LIMIT 1', [lead.id],
+    );
+    assert.equal(reason!.stopped_reason, 'opted_out');
+  });
+
+  test('one sequence can be stopped without touching the others', () => {
+    const { lead } = createLead(
+      {
+        first_name: 'Selective', last_name: 'Stop', phone: '+30 691 555 0003', email: 'sel@test.gr',
+        project_types: ['pv'], estimated_value: 20000,
+      },
+      { orgId: orgA, userId: userA, allowDuplicate: true },
+    );
+    // A second sequence: crossing into hot enrols the notify rule as well.
+    emit({ type: 'temperature_changed', orgId: orgA, leadId: lead.id, from: 'warm', to: 'hot' });
+    const active = all<{ id: string }>(
+      "SELECT id FROM automation_runs WHERE org_id = ? AND lead_id = ? AND status = 'active'", [orgA, lead.id],
+    );
+    if (active.length < 2) return; // nothing to prove if only one rule matched
+    assert.equal(stopRun(orgA, active[0].id, 'stopped_manually'), true);
+    const stillActive = get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM automation_runs WHERE lead_id = ? AND status = 'active'", [lead.id],
+    )!.n;
+    assert.equal(stillActive, active.length - 1);
+    assert.equal(stopRun(orgA, active[0].id, 'stopped_manually'), false, 'stopping twice is a no-op');
+  });
+
+  test('the customer-messaging sequences ship switched off', () => {
+    for (const key of ['new_lead_messages', 'quote_follow_up_messages']) {
+      const rule = get<{ is_active: number; steps: string }>(
+        'SELECT is_active, steps FROM automation_rules WHERE org_id = ? AND key = ?', [orgA, key],
+      );
+      assert.ok(rule, `${key} should be provisioned`);
+      assert.equal(rule!.is_active, 0, `${key} must not send messages until it is switched on`);
+      const steps = JSON.parse(rule!.steps);
+      assert.equal(steps.length, 4, 'four follow-ups, as specified');
+      // Every step must be able to stop once the customer answers.
+      for (const step of steps) {
+        assert.ok(step.stop_if?.includes('customer_replied'), 'a reply must end the sequence');
+      }
+    }
+  });
+
+  test('the default sequences message the customer at most once', () => {
+    const sends = all<{ key: string; steps: string }>(
+      'SELECT key, steps FROM automation_rules WHERE org_id = ? AND is_active = 1', [orgA],
+    ).flatMap((rule) => JSON.parse(rule.steps)
+      .flatMap((step: any) => step.actions ?? [])
+      .filter((action: any) => action.type === 'send_template')
+      .map(() => rule.key));
+    // The acknowledgement and the appointment reminder. Everything else a default
+    // rule does is a task or an internal notification.
+    assert.deepEqual(sends.sort(), ['appointment_reminder', 'new_lead']);
+  });
+});
+
+// ------------------------------------------------------- action dashboard
+
+describe('what needs attention', () => {
+  test('the list is ranked, actionable and scoped to the company', () => {
+    const items = buildAttentionList({ orgId: orgA, userId: userA, seesAll: true, staleHours: 48 });
+    assert.ok(items.length > 0, 'the seeded organisation has work waiting');
+
+    for (const item of items) {
+      assert.ok(item.name && item.name.length > 0, 'every item names the customer');
+      assert.ok(item.reason.length > 0, 'every item says why it is here');
+      assert.ok(item.action_label.length > 0, 'every item offers an action');
+      assert.ok(item.link.startsWith('/app/'), 'every item links to the record');
+      assert.ok([1, 2, 3].includes(item.priority));
+    }
+    // Urgent first; within a priority, the money leads.
+    for (let i = 1; i < items.length; i += 1) {
+      assert.ok(items[i - 1].priority <= items[i].priority, 'the list must stay ranked');
+    }
+
+    const other = buildAttentionList({ orgId: orgB, userId: userB, seesAll: true, staleHours: 48 });
+    const leakedIds = new Set(items.map((i) => i.id));
+    for (const item of other) {
+      assert.ok(!leakedIds.has(item.id), 'no item may appear in two companies');
+    }
+  });
+
+  test('a completed survey with no quotation is surfaced as work to do', () => {
+    const { lead } = createLead(
+      {
+        first_name: 'Needs', last_name: 'Quoting', phone: '+30 691 666 0001', email: 'nq@test.gr',
+        project_types: ['pv'],
+      },
+      { orgId: orgA, userId: userA, skipAutomation: true, allowDuplicate: true },
+    );
+    const now = nowIso();
+    run(
+      `INSERT INTO site_surveys (id, org_id, lead_id, project_type, status, completed_at, findings, created_at, updated_at)
+       VALUES (?,?,?, 'pv', 'completed', ?, '{}', ?, ?)`,
+      [newId('srv'), orgA, lead.id, now, now, now],
+    );
+    const items = buildAttentionList({ orgId: orgA, userId: userA, seesAll: true, staleHours: 48 });
+    const entry = items.find((i) => i.kind === 'survey_to_quote' && i.lead_id === lead.id);
+    assert.ok(entry, 'a surveyed-but-unquoted lead is exactly what gets forgotten');
+    assert.equal(entry!.action, 'create_quote');
+    assert.equal(entry!.priority, 1);
+  });
+
+  test('a salesperson only sees their own work', () => {
+    const mine = buildAttentionList({ orgId: orgA, userId: userB, seesAll: false, staleHours: 48 });
+    // userB belongs to organisation B, so scoped to their own book inside A they
+    // own nothing at all.
+    assert.equal(mine.filter((i) => i.kind !== 'installation_due').length, 0);
+    // Unassigned leads are a manager's job and never appear in a scoped list.
+    assert.equal(mine.some((i) => i.kind === 'unassigned'), false);
   });
 });

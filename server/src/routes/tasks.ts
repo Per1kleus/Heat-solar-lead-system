@@ -6,11 +6,12 @@ import { requirePermission } from '../middleware/context.ts';
 import { createTask, completeTask, rescheduleTask } from '../lib/tasks.ts';
 import { logActivity, recomputeNextAction } from '../lib/leads.ts';
 import { nowIso, startOfDay, addDays } from '../lib/time.ts';
-import { badRequest, forbidden, notFound } from '../lib/errors.ts';
+import { badRequest, conflict, forbidden, notFound } from '../lib/errors.ts';
 import { newId } from '../lib/ids.ts';
 import { audit } from '../lib/audit.ts';
 import { emit } from '../lib/events.ts';
 import { readIdempotent, writeIdempotent } from '../lib/idempotency.ts';
+import { resolveChannel, sendTemplate } from '../lib/messaging.ts';
 
 export const tasksRouter = Router();
 
@@ -232,7 +233,55 @@ const apptSchema = z.object({
   assignee_id: z.string().nullish(),
   technician_id: z.string().nullish(),
   create_survey: z.boolean().optional(),
+  /** Send the customer a confirmation through a connected channel. */
+  notify_customer: z.boolean().optional(),
+  /** Book anyway despite an overlap the caller has seen and accepted. */
+  allow_conflict: z.boolean().optional(),
 });
+
+export interface ApptConflict {
+  id: string;
+  title: string;
+  starts_at: string;
+  ends_at: string;
+  user_id: string;
+  user_name: string;
+}
+
+/**
+ * Anything already booked for the same person over the same period. An installer
+ * double-booking a technician is the scheduling mistake that actually happens, so
+ * it is refused unless the caller explicitly accepts it.
+ */
+export function findApptConflicts(
+  orgId: string, starts: Date, ends: Date, userIds: (string | null | undefined)[], excludeId?: string,
+): ApptConflict[] {
+  const ids = [...new Set(userIds.filter(Boolean) as string[])];
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => '?').join(',');
+  return all<ApptConflict>(
+    `SELECT a.id, a.title, a.starts_at, a.ends_at,
+            COALESCE(a.technician_id, a.assignee_id) AS user_id,
+            COALESCE(tech.first_name || ' ' || tech.last_name, u.first_name || ' ' || u.last_name, 'Someone') AS user_name
+     FROM appointments a
+     LEFT JOIN users u ON u.id = a.assignee_id
+     LEFT JOIN users tech ON tech.id = a.technician_id
+     WHERE a.org_id = ? AND a.status = 'scheduled'
+       AND (a.assignee_id IN (${placeholders}) OR a.technician_id IN (${placeholders}))
+       AND a.starts_at < ? AND a.ends_at > ?
+       ${excludeId ? 'AND a.id != ?' : ''}
+     ORDER BY a.starts_at LIMIT 5`,
+    [orgId, ...ids, ...ids, ends.toISOString(), starts.toISOString(), ...(excludeId ? [excludeId] : [])],
+  );
+}
+
+function conflictError(conflicts: ApptConflict[]): never {
+  const first = conflicts[0];
+  throw conflict(
+    `${first.user_name} is already booked for "${first.title}" at that time.`,
+    { conflicts, hint: 'Choose another time, assign someone else, or book it anyway.' },
+  );
+}
 
 appointmentsRouter.post('/', requirePermission('appointments:write'), ah((req, res) => {
   const body = apptSchema.parse(req.body);
@@ -245,6 +294,13 @@ appointmentsRouter.post('/', requirePermission('appointments:write'), ah((req, r
   const lead = body.lead_id
     ? get<any>('SELECT * FROM leads WHERE id = ? AND org_id = ?', [body.lead_id, orgId])
     : null;
+  if (body.lead_id && !lead) throw notFound('That lead no longer exists.');
+
+  if (!body.allow_conflict) {
+    const conflicts = findApptConflicts(orgId, starts, ends, [body.assignee_id ?? req.ctx.user.id, body.technician_id]);
+    if (conflicts.length > 0) conflictError(conflicts);
+  }
+
   const id = newId('apt');
   const now = nowIso();
   run(
@@ -308,45 +364,165 @@ appointmentsRouter.post('/', requirePermission('appointments:write'), ah((req, r
     orgId, userId: req.ctx.user.id, action: 'appointment.created', entityType: 'appointment', entityId: id,
     entityLabel: body.title,
   });
-  res.status(201).json({ appointment: get(`${APPT_SELECT} WHERE a.id = ?`, [id]), survey_id: surveyId });
+
+  const respond = (notification: AppointmentNotification | null) => {
+    run('UPDATE appointments SET confirmation_sent_at = ? WHERE id = ? AND org_id = ?', [
+      notification?.sent ? nowIso() : null, id, orgId,
+    ]);
+    res.status(201).json({
+      appointment: get(`${APPT_SELECT} WHERE a.id = ?`, [id]),
+      survey_id: surveyId,
+      notification,
+    });
+  };
+
+  if (body.notify_customer && body.lead_id) {
+    // The caller waits for the provider's answer: the dialog must be able to say
+    // "confirmation sent" or "not sent, because…", never guess.
+    void notifyCustomer(orgId, id, body.lead_id, confirmationTemplate(body.type), req.ctx.user.id)
+      .then(respond)
+      .catch(() => respond({ sent: false, reason: 'The confirmation could not be sent.' }));
+    return;
+  }
+  respond(null);
 }));
 
+export interface AppointmentNotification {
+  sent: boolean;
+  channel?: string;
+  reason?: string;
+}
+
+function confirmationTemplate(type: string): string {
+  if (type === 'site_survey') return 'survey_confirmation';
+  if (type === 'installation') return 'installation_confirmation';
+  return 'appointment_confirmation';
+}
+
+/**
+ * Sends one appointment message to the customer through a connected channel.
+ * Returns what the provider actually did — a refusal is never dressed up as a
+ * send, and the attempt is on the timeline either way.
+ */
+async function notifyCustomer(
+  orgId: string, appointmentId: string, leadId: string, templateKey: string, userId: string | null,
+): Promise<AppointmentNotification> {
+  const lead = get<any>('SELECT * FROM leads WHERE id = ? AND org_id = ?', [leadId, orgId]);
+  if (!lead) return { sent: false, reason: 'That lead no longer exists.' };
+  const resolved = resolveChannel(orgId, lead, 'preferred');
+  // No address at all: nothing to attempt, and nothing to record.
+  if (!resolved.channel) return { sent: false, reason: resolved.reason };
+  const result = await sendTemplate({
+    orgId, templateKey, channel: resolved.channel, leadId, appointmentId, userId,
+    purpose: 'operational',
+  });
+  return result.sent
+    ? { sent: true, channel: resolved.channel }
+    : { sent: false, channel: resolved.channel, reason: result.reason };
+}
+
 appointmentsRouter.patch('/:id', requirePermission('appointments:write'), ah((req, res) => {
-  const appt = get<any>('SELECT * FROM appointments WHERE id = ? AND org_id = ?', [req.params.id, req.ctx.orgId]);
+  const { orgId } = req.ctx;
+  const appt = get<any>('SELECT * FROM appointments WHERE id = ? AND org_id = ?', [req.params.id, orgId]);
   if (!appt) throw notFound('That appointment no longer exists.');
   const body = apptSchema.partial().extend({
     status: z.enum(['scheduled', 'completed', 'cancelled', 'no_show']).optional(),
     outcome_note: z.string().nullish(),
   }).parse(req.body);
 
+  const rescheduled = Boolean(body.starts_at) && body.starts_at !== appt.starts_at;
+  const starts = new Date(body.starts_at ?? appt.starts_at);
+  if (Number.isNaN(starts.getTime())) throw badRequest('That start time is not a valid date.');
+  const ends = body.ends_at
+    ? new Date(body.ends_at)
+    : rescheduled
+      ? new Date(starts.getTime() + (new Date(appt.ends_at).getTime() - new Date(appt.starts_at).getTime()))
+      : new Date(appt.ends_at);
+  if (ends <= starts) throw badRequest('The appointment must end after it starts.');
+
+  const staysScheduled = (body.status ?? appt.status) === 'scheduled';
+  if (staysScheduled && !body.allow_conflict && (rescheduled || body.assignee_id || body.technician_id)) {
+    const conflicts = findApptConflicts(
+      orgId, starts, ends,
+      [body.assignee_id ?? appt.assignee_id, body.technician_id ?? appt.technician_id],
+      appt.id,
+    );
+    if (conflicts.length > 0) conflictError(conflicts);
+  }
+
   const map: Record<string, any> = {
-    title: body.title, description: body.description, starts_at: body.starts_at, ends_at: body.ends_at,
-    location: body.location, assignee_id: body.assignee_id, technician_id: body.technician_id,
+    title: body.title, description: body.description, location: body.location,
+    assignee_id: body.assignee_id, technician_id: body.technician_id,
     status: body.status, outcome_note: body.outcome_note, type: body.type,
+    starts_at: body.starts_at ? starts.toISOString() : undefined,
+    ends_at: body.starts_at || body.ends_at ? ends.toISOString() : undefined,
+    // A moved appointment needs its reminder again.
+    reminder_sent_at: rescheduled ? null : undefined,
   };
   const keys = Object.keys(map).filter((k) => map[k] !== undefined);
   if (keys.length > 0) {
     run(
       `UPDATE appointments SET ${keys.map((k) => `${k} = ?`).join(', ')}, updated_at = ? WHERE id = ? AND org_id = ?`,
-      [...keys.map((k) => map[k]), nowIso(), appt.id, req.ctx.orgId],
+      [...keys.map((k) => map[k]), nowIso(), appt.id, orgId],
     );
   }
-  if (body.starts_at) {
+  if (rescheduled) {
     run('UPDATE site_surveys SET scheduled_at = ?, updated_at = ? WHERE appointment_id = ? AND org_id = ?', [
-      body.starts_at, nowIso(), appt.id, req.ctx.orgId,
+      starts.toISOString(), nowIso(), appt.id, orgId,
+    ]);
+    run("UPDATE tasks SET due_at = ? WHERE appointment_id = ? AND org_id = ? AND status = 'open'", [
+      starts.toISOString(), appt.id, orgId,
     ]);
   }
-  if (appt.lead_id && (body.status || body.starts_at)) {
+  if (body.status && body.status !== 'scheduled') {
+    run("UPDATE tasks SET status = 'cancelled' WHERE appointment_id = ? AND org_id = ? AND status = 'open'", [
+      appt.id, orgId,
+    ]);
+    if (body.status === 'cancelled') {
+      run("UPDATE site_surveys SET status = 'cancelled', updated_at = ? WHERE appointment_id = ? AND org_id = ? AND status != 'completed'", [
+        nowIso(), appt.id, orgId,
+      ]);
+    }
+  }
+
+  if (appt.lead_id && (body.status || rescheduled)) {
     logActivity({
-      orgId: req.ctx.orgId, leadId: appt.lead_id, type: 'appointment',
-      title: body.status
-        ? `Appointment ${body.status.replace('_', ' ')}: ${appt.title}`
-        : `Appointment rescheduled to ${new Date(body.starts_at!).toLocaleString('en-GB')}`,
+      orgId, leadId: appt.lead_id, type: 'appointment',
+      title: body.status && body.status !== 'scheduled'
+        ? `Appointment ${STATUS_LABEL[body.status]}: ${appt.title}`
+        : `Appointment moved to ${starts.toLocaleString('en-GB')}`,
       body: body.outcome_note ?? null, userId: req.ctx.user.id,
+      meta: { appointment_id: appt.id },
     });
   }
-  res.json({ appointment: get(`${APPT_SELECT} WHERE a.id = ?`, [appt.id]) });
+  if (body.status === 'cancelled') {
+    emit({ type: 'appointment_cancelled', orgId, leadId: appt.lead_id, appointmentId: appt.id });
+  }
+  audit({
+    orgId, userId: req.ctx.user.id,
+    action: body.status ? `appointment.${body.status}` : 'appointment.updated',
+    entityType: 'appointment', entityId: appt.id, entityLabel: appt.title,
+    changes: rescheduled ? { starts_at: { from: appt.starts_at, to: starts.toISOString() } } : undefined,
+  });
+
+  const finish = (notification: AppointmentNotification | null) => {
+    res.json({ appointment: get(`${APPT_SELECT} WHERE a.id = ?`, [appt.id]), notification });
+  };
+  const template = body.status === 'cancelled'
+    ? 'appointment_cancelled'
+    : rescheduled ? 'appointment_rescheduled' : null;
+  if (body.notify_customer && template && appt.lead_id) {
+    void notifyCustomer(orgId, appt.id, appt.lead_id, template, req.ctx.user.id)
+      .then(finish)
+      .catch(() => finish({ sent: false, reason: 'The message could not be sent.' }));
+    return;
+  }
+  finish(null);
 }));
+
+const STATUS_LABEL: Record<string, string> = {
+  scheduled: 'scheduled', completed: 'completed', cancelled: 'cancelled', no_show: 'missed',
+};
 
 function labelType(type: string): string {
   return ({

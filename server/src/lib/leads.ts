@@ -52,6 +52,7 @@ export function shapeLead(lead: any): any {
     pv_existing_system: !!lead.pv_existing_system,
     budget_known: !!lead.budget_known,
     requested_quote: !!lead.requested_quote,
+    messaging_opt_out: !!lead.messaging_opt_out,
     automation_paused: !!lead.automation_paused,
     consent_marketing: !!lead.consent_marketing,
     has_next_action: Boolean(lead.next_task_id),

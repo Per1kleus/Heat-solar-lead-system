@@ -22,6 +22,8 @@ export const TRIGGERS = [
   { key: 'lead_idle', label: 'A lead has had no activity', config: [{ key: 'hours', label: 'Hours without activity', type: 'number' }] },
   { key: 'no_next_action', label: 'An open lead has no next action', config: [] },
   { key: 'appointment_scheduled', label: 'An appointment is scheduled', config: [] },
+  { key: 'appointment_reminder_due', label: 'An appointment is coming up tomorrow', config: [] },
+  { key: 'installation_completed', label: 'An installation is completed', config: [] },
 ];
 
 export const ACTIONS = [
@@ -29,7 +31,7 @@ export const ACTIONS = [
   { key: 'notify_owner', label: 'Notify the lead owner', fields: ['title', 'body', 'severity', 'notification_type'] },
   { key: 'notify_assignee', label: 'Notify the task assignee', fields: ['title', 'body', 'severity'] },
   { key: 'notify_managers', label: 'Notify sales managers', fields: ['title', 'body', 'severity'] },
-  { key: 'send_template', label: 'Send a message template', fields: ['template_key', 'channel', 'purpose'] },
+  { key: 'send_template', label: 'Send a message to the customer', fields: ['template_key', 'channel', 'purpose'] },
   { key: 'change_stage', label: 'Move the lead to a stage', fields: ['stage_key'] },
   { key: 'add_tag', label: 'Add a tag', fields: ['tag'] },
   { key: 'schedule_recovery', label: 'Schedule the lost-lead recovery task', fields: [] },
@@ -44,6 +46,8 @@ export const STOP_CONDITIONS = [
   { key: 'won', label: 'The deal was won' },
   { key: 'lost', label: 'The lead was lost' },
   { key: 'paused', label: 'Automation was paused on the lead' },
+  { key: 'opted_out', label: 'The contact opted out of automatic messages' },
+  { key: 'appointment_cancelled', label: 'The appointment was cancelled or completed' },
 ];
 
 automationsRouter.get('/', requirePermission('automation:read'), ah((req, res) => {

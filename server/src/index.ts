@@ -30,8 +30,11 @@ import { onboardingRouter } from './routes/onboarding.ts';
 import { getSubscription } from './lib/billing.ts';
 import { parseJson } from './lib/db.ts';
 import { isAiAvailable } from './lib/ai.ts';
+import { syncAllOrgDefaults } from './lib/provision.ts';
 
 applySchema();
+// New default templates and automation rules reach existing companies too.
+syncAllOrgDefaults();
 registerAutomationEngine();
 
 const app = express();

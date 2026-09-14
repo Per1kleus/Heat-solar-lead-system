@@ -110,7 +110,7 @@ export default function QuotationDetail() {
         </div>
       </Card>
 
-      <div className="grid mt-4" style={{ gridTemplateColumns: 'minmax(0, 1.6fr) minmax(0, 1fr)', alignItems: 'start', gap: 16 }}>
+      <div className="grid split mt-4">
         <Card title="Scope and pricing" padded={false}>
           <div className="table-wrap">
             <table className="data">

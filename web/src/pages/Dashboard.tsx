@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { get } from '../lib/api';
@@ -5,12 +6,17 @@ import { useSession } from '../lib/session';
 import {
   Avatar, Badge, Button, Card, EmptyState, ErrorBlock, Icon, Kpi, LoadingBlock, ScoreRing, TemperatureBadge,
 } from '../components/ui';
-import { money, moneyShort, dateTime, relative, isOverdue, time, projectTypeLabel, percent } from '../lib/format';
+import { money, moneyShort, relative, isOverdue, time, projectTypeLabel, percent } from '../lib/format';
+import LeadComposer from '../components/LeadComposer';
+import AppointmentOutcome from '../components/AppointmentOutcome';
 
 export default function Dashboard() {
   const { user, organization } = useSession();
   const navigate = useNavigate();
   const currency = organization?.currency ?? 'EUR';
+  // The item the owner is acting on right now, if the action opens a dialog
+  // rather than navigating.
+  const [acting, setActing] = useState<any | null>(null);
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ['dashboard'],
@@ -29,8 +35,24 @@ export default function Dashboard() {
   if (error) return <div className="page"><ErrorBlock error={error} onRetry={refetch} /></div>;
 
   const k = data.kpis;
-  const a = data.needs_attention;
   const hour = new Date().getHours();
+
+  /** Do the thing from here when that is practical; otherwise open the record. */
+  const act = (item: any) => {
+    if ((item.action === 'contact' || item.action === 'follow_up') && item.lead_id) {
+      setActing(item);
+      return;
+    }
+    if (item.action === 'close_appointment' && item.appointment_id) {
+      setActing(item);
+      return;
+    }
+    if (item.action === 'create_quote' && item.lead_id) {
+      navigate(`/app/quotations?new=1&lead_id=${item.lead_id}&survey_id=${item.survey_id}`);
+      return;
+    }
+    navigate(item.link);
+  };
   const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
 
   return (
@@ -49,8 +71,14 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* ---- needs attention: the single most important panel ---- */}
-      <AttentionPanel attention={a} total={data.attention_total} currency={currency} />
+      {/* ---- what to do now: the single most important panel ---- */}
+      <ActionPanel
+        items={data.attention ?? []}
+        counts={data.attention_counts ?? {}}
+        urgent={data.urgent_total ?? 0}
+        currency={currency}
+        onAct={act}
+      />
 
       {/* ---- KPIs ---- */}
       <div className="kpi-grid mt-6">
@@ -179,14 +207,65 @@ export default function Dashboard() {
           </Card>
         </div>
       </div>
+
+      {acting && (acting.action === 'contact' || acting.action === 'follow_up') && (
+        <LeadComposer
+          leadId={acting.lead_id}
+          channel="whatsapp"
+          templateKey={acting.action === 'follow_up' ? 'quote_follow_up' : undefined}
+          quotationId={acting.quotation_id ?? undefined}
+          onClose={() => setActing(null)}
+          onSent={() => { setActing(null); refetch(); }}
+        />
+      )}
+      {acting && acting.action === 'close_appointment' && (
+        <AppointmentOutcome
+          appointment={{
+            id: acting.appointment_id,
+            title: acting.context ?? acting.name,
+            starts_at: acting.due_at,
+          }}
+          onClose={() => setActing(null)}
+          onSaved={() => { setActing(null); refetch(); }}
+        />
+      )}
     </div>
   );
 }
 
-function AttentionPanel({ attention, total, currency }: { attention: any; total: number; currency: string }) {
-  const navigate = useNavigate();
+const KIND_META: Record<string, { mark: string; group: string }> = {
+  overdue_task: { mark: '🔴', group: 'Overdue follow-ups' },
+  appointment_missed: { mark: '📵', group: 'Appointments not closed off' },
+  hot_lead: { mark: '🔥', group: 'Hot leads going quiet' },
+  survey_to_quote: { mark: '📐', group: 'Surveys waiting for a quotation' },
+  quote_viewed: { mark: '👀', group: 'Quotations opened, not answered' },
+  quote_awaiting: { mark: '🟠', group: 'Quotations awaiting a response' },
+  appointment_upcoming: { mark: '📅', group: 'Coming up' },
+  no_next_action: { mark: '⚠️', group: 'No next action' },
+  unassigned: { mark: '👤', group: 'Unassigned leads' },
+  idle_lead: { mark: '🕓', group: 'No recent contact' },
+  installation_due: { mark: '🔧', group: 'Installations' },
+  recovery_due: { mark: '🔄', group: 'Lost leads worth revisiting' },
+};
 
-  if (total === 0) {
+/**
+ * The dashboard's working surface: what to do now, in priority order, each with
+ * the button that does it. The list comes from the server already ranked — the
+ * UI only decides how to draw it and which dialog a button opens.
+ */
+function ActionPanel({
+  items, counts, urgent, currency, onAct,
+}: {
+  items: any[];
+  counts: Record<string, number>;
+  urgent: number;
+  currency: string;
+  onAct: (item: any) => void;
+}) {
+  const navigate = useNavigate();
+  const [filter, setFilter] = useState<string>('all');
+
+  if (items.length === 0) {
     return (
       <Card>
         <div className="row gap-6">
@@ -194,7 +273,8 @@ function AttentionPanel({ attention, total, currency }: { attention: any; total:
           <div>
             <h2>Nothing needs your attention</h2>
             <p className="small muted" style={{ margin: 0 }}>
-              No overdue follow-ups, no unanswered quotations, every open lead has a next action. Well played.
+              No overdue follow-ups, no unanswered quotations, every survey quoted and every open
+              lead has a next action. Well played.
             </p>
           </div>
         </div>
@@ -202,129 +282,72 @@ function AttentionPanel({ attention, total, currency }: { attention: any; total:
     );
   }
 
-  const groups: { key: string; mark: string; label: string; items: any[]; render: (item: any) => React.ReactNode; go: (item: any) => string }[] = [
-    {
-      key: 'overdue', mark: '🔴',
-      label: `${attention.overdue_follow_ups.length} overdue follow-up${attention.overdue_follow_ups.length === 1 ? '' : 's'}`,
-      items: attention.overdue_follow_ups,
-      go: (t) => (t.lead_id ? `/app/leads/${t.lead_id}` : '/app/tasks'),
-      render: (t) => (
-        <>
-          <div className="grow" style={{ minWidth: 0 }}>
-            <div className="truncate strong">{t.title}</div>
-            <div className="tiny dim truncate">
-              {t.first_name ? `${t.first_name} ${t.last_name} · ` : ''}due {dateTime(t.due_at)} ({relative(t.due_at)})
-            </div>
-          </div>
-          {t.estimated_value ? <span className="small strong nowrap">{money(t.estimated_value, currency)}</span> : null}
-        </>
-      ),
-    },
-    {
-      key: 'quotes', mark: '🟠',
-      label: `${attention.quotes_awaiting.length} quote${attention.quotes_awaiting.length === 1 ? '' : 's'} awaiting a response`,
-      items: attention.quotes_awaiting,
-      go: (q) => `/app/quotations/${q.id}`,
-      render: (q) => (
-        <>
-          <div className="grow" style={{ minWidth: 0 }}>
-            <div className="truncate strong">{q.number} — {q.first_name ? `${q.first_name} ${q.last_name}` : q.title}</div>
-            <div className="tiny dim truncate">Sent {relative(q.sent_at)} · {q.status.replace('_', ' ')}</div>
-          </div>
-          <span className="small strong nowrap">{money(q.total, q.currency ?? currency)}</span>
-        </>
-      ),
-    },
-    {
-      key: 'stale', mark: '🔥',
-      label: `${attention.stale_hot_leads.length} hot lead${attention.stale_hot_leads.length === 1 ? '' : 's'} with no activity for ${attention.stale_hours} hours`,
-      items: attention.stale_hot_leads,
-      go: (l) => `/app/leads/${l.id}`,
-      render: (l) => (
-        <>
-          <div className="grow" style={{ minWidth: 0 }}>
-            <div className="truncate strong">{l.first_name} {l.last_name}</div>
-            <div className="tiny dim">Last activity {l.last_activity_at ? relative(l.last_activity_at) : 'never'} · score {l.score}</div>
-          </div>
-          <span className="small strong nowrap">{money(l.estimated_value, currency)}</span>
-        </>
-      ),
-    },
-    {
-      key: 'noaction', mark: '⚠️',
-      label: `${attention.no_next_action.length} lead${attention.no_next_action.length === 1 ? '' : 's'} without a next action`,
-      items: attention.no_next_action,
-      go: (l) => `/app/leads/${l.id}`,
-      render: (l) => (
-        <>
-          <div className="grow" style={{ minWidth: 0 }}>
-            <div className="truncate strong">{l.first_name} {l.last_name}</div>
-            <div className="tiny dim">Created {relative(l.created_at)} · nothing scheduled</div>
-          </div>
-          <span className="small strong nowrap">{money(l.estimated_value, currency)}</span>
-        </>
-      ),
-    },
-    {
-      key: 'unassigned', mark: '👤',
-      label: `${attention.unassigned.length} unassigned lead${attention.unassigned.length === 1 ? '' : 's'}`,
-      items: attention.unassigned,
-      go: (l) => `/app/leads/${l.id}`,
-      render: (l) => (
-        <>
-          <div className="grow" style={{ minWidth: 0 }}>
-            <div className="truncate strong">{l.first_name} {l.last_name}</div>
-            <div className="tiny dim">Arrived {relative(l.created_at)} · nobody owns it</div>
-          </div>
-          <span className="small strong nowrap">{money(l.estimated_value, currency)}</span>
-        </>
-      ),
-    },
-    {
-      key: 'recovery', mark: '🔄',
-      label: `${attention.recovery_due.length} lost lead${attention.recovery_due.length === 1 ? '' : 's'} due for recovery`,
-      items: attention.recovery_due,
-      go: (l) => `/app/leads/${l.id}`,
-      render: (l) => (
-        <>
-          <div className="grow" style={{ minWidth: 0 }}>
-            <div className="truncate strong">{l.first_name} {l.last_name}</div>
-            <div className="tiny dim">{l.reason} · recontact {relative(l.recovery_date)}</div>
-          </div>
-          <span className="small strong nowrap">{money(l.estimated_value, currency)}</span>
-        </>
-      ),
-    },
-  ].filter((group) => group.items.length > 0);
+  const kinds = Object.keys(counts).sort(
+    (a, b) => (items.findIndex((i) => i.kind === a)) - (items.findIndex((i) => i.kind === b)),
+  );
+  const shown = filter === 'all' ? items : items.filter((item) => item.kind === filter);
 
   return (
     <Card
-      title={<h2 className="row gap-4"><Icon name="alert" size={17} />Needs attention</h2>}
-      subtitle={`${total} item${total === 1 ? '' : 's'} waiting on you`}
+      title={<h2 className="row gap-4"><Icon name="alert" size={17} />What needs you now</h2>}
+      subtitle={
+        urgent > 0
+          ? `${urgent} urgent of ${items.length} — highest value first`
+          : `${items.length} item${items.length === 1 ? '' : 's'} waiting on you`
+      }
       padded={false}
     >
-      <div className="attention-grid">
-        {groups.map((group) => (
-          <div key={group.key} className="attention-group">
-            <div className="row gap-4" style={{ padding: '9px 12px', background: 'var(--surface-2)' }}>
-              <span aria-hidden="true">{group.mark}</span>
-              <span className="small strong grow">{group.label}</span>
+      <div className="card-body tight">
+        <div className="chips">
+          <button type="button" className={`chip ${filter === 'all' ? 'on' : ''}`} onClick={() => setFilter('all')}>
+            Everything {items.length}
+          </button>
+          {kinds.map((kind) => (
+            <button
+              key={kind} type="button"
+              className={`chip ${filter === kind ? 'on' : ''}`}
+              onClick={() => setFilter(kind)}
+            >
+              <span aria-hidden="true">{KIND_META[kind]?.mark ?? '•'}</span>
+              {KIND_META[kind]?.group ?? kind} {counts[kind]}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ borderTop: '1px solid var(--border)' }}>
+        {shown.slice(0, 12).map((item) => (
+          <div key={item.id} className="attention-item action-row">
+            <span
+              aria-hidden="true"
+              title={KIND_META[item.kind]?.group ?? item.kind}
+              style={{ fontSize: 15, width: 20, textAlign: 'center' }}
+            >
+              {KIND_META[item.kind]?.mark ?? '•'}
+            </span>
+            <button
+              className="grow action-row-main"
+              onClick={() => navigate(item.link)}
+              style={{ minWidth: 0, textAlign: 'left', border: 0, background: 'none', font: 'inherit', cursor: 'pointer', padding: 0 }}
+            >
+              <div className="row gap-4" style={{ minWidth: 0 }}>
+                <span className="strong truncate">{item.name}</span>
+                {item.priority === 1 && <Badge tone="danger">Now</Badge>}
+              </div>
+              <div className="small truncate" style={{ color: 'var(--ink-2)' }}>{item.reason}</div>
+              {item.context && <div className="tiny dim truncate">{item.context}</div>}
+            </button>
+            <div className="right nowrap" style={{ minWidth: 0 }}>
+              {item.value ? <div className="small strong">{money(item.value, currency)}</div> : null}
             </div>
-            {group.items.slice(0, 4).map((item: any) => (
-              <button
-                key={item.id} className="attention-item"
-                style={{ width: '100%', textAlign: 'left', border: 0, background: 'none', font: 'inherit' }}
-                onClick={() => navigate(group.go(item))}
-              >
-                {group.render(item)}
-                <Icon name="chevron" size={13} />
-              </button>
-            ))}
-            {group.items.length > 4 && (
-              <div className="tiny dim" style={{ padding: '6px 12px' }}>+ {group.items.length - 4} more</div>
-            )}
+            <Button size="sm" variant="primary" onClick={() => onAct(item)}>{item.action_label}</Button>
           </div>
         ))}
+        {shown.length > 12 && (
+          <div className="tiny dim" style={{ padding: '8px 12px' }}>
+            + {shown.length - 12} more in this group
+          </div>
+        )}
       </div>
     </Card>
   );
