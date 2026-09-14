@@ -243,6 +243,9 @@ CREATE TABLE IF NOT EXISTS leads (
   urgency       TEXT DEFAULT 'unknown' CHECK (urgency IN ('immediate','1_3_months','3_6_months','later','unknown')),
   budget_known  INTEGER NOT NULL DEFAULT 0,
   budget_amount REAL,
+  -- The customer asked for a price, rather than us having sent one. It is the
+  -- single strongest early qualifier, so it is recorded from the moment it is known.
+  requested_quote INTEGER NOT NULL DEFAULT 0,
 
   -- lifecycle
   first_contacted_at TEXT,
@@ -317,6 +320,8 @@ CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(org_id, email);
 CREATE INDEX IF NOT EXISTS idx_leads_dedupe ON leads(org_id, dedupe_key);
 CREATE INDEX IF NOT EXISTS idx_leads_activity ON leads(org_id, last_activity_at);
 CREATE INDEX IF NOT EXISTS idx_leads_temp ON leads(org_id, temperature, status);
+-- Drives the score-decay sweep: the open leads with the oldest scores, first.
+CREATE INDEX IF NOT EXISTS idx_leads_scored ON leads(status, scored_at);
 
 CREATE TABLE IF NOT EXISTS lead_tags (
   org_id        TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,

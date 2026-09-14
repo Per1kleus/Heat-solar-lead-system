@@ -128,6 +128,7 @@ const leadBodySchema = z.object({
   expected_close_date: z.string().nullish(),
   urgency: z.enum(['immediate', '1_3_months', '3_6_months', 'later', 'unknown']).nullish(),
   budget_known: z.boolean().nullish(),
+  requested_quote: z.boolean().nullish(),
   budget_amount: z.number().nullish(),
   consent_marketing: z.boolean().nullish(),
   tags: z.array(z.string()).nullish(),

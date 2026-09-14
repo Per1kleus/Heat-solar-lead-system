@@ -57,6 +57,20 @@ async function refresh(): Promise<string | null> {
   return refreshPromise;
 }
 
+/**
+ * A stable key for one submission attempt. Mount it with the dialog that creates
+ * the record: a double-click or a retried request reuses it and cannot create a
+ * duplicate, while a genuinely new submission (a second quotation for the same
+ * property, an identical follow-up task next week) gets its own key and is
+ * created normally. Deriving the key from the content instead would silently
+ * swallow the second one.
+ */
+export function newRequestId(): string {
+  return globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID()
+    : `rq-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 export interface RequestOptions extends Omit<RequestInit, 'body'> {
   body?: unknown;
   /** Retried requests carrying the same key never create a duplicate record. */

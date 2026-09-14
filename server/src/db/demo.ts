@@ -380,6 +380,8 @@ export function seedDemoData(orgId: string, userId: string): { leads: number; qu
         estimated_value: spec.estimated_value,
         campaign: spec.campaign,
         urgency: spec.urgency ?? 'unknown',
+        // Everyone past the first conversation has asked us for a price.
+        requested_quote: spec.stage === 'new' ? 0 : 1,
         expected_close_date: addDays(new Date(), 14 + index * 3),
         ...(spec.fields ?? {}),
       },

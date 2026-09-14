@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { get, post, patch } from '../lib/api';
+import { get, newRequestId, post, patch } from '../lib/api';
 import { useSession } from '../lib/session';
 import { Badge, Button, Field, Icon, Modal, useDebounced, useToast } from './ui';
 import { money, toInputDate } from '../lib/format';
@@ -133,6 +133,10 @@ export default function QuotationBuilder({
   const update = (key: string, patchLine: Partial<Line>) =>
     setLines((current) => current.map((line) => (line.key === key ? { ...line, ...patchLine } : line)));
 
+  // One key per builder session, so a double-click cannot create two
+  // quotations while a genuine second quotation still can be created.
+  const requestId = useRef(newRequestId());
+
   const save = async () => {
     if (!selectedLead) return toast.show('Choose which lead this quotation is for.', 'error');
     if (!title.trim()) return toast.show('Give the quotation a title.', 'error');
@@ -155,7 +159,7 @@ export default function QuotationBuilder({
       };
       const result = quotation
         ? await patch(`/quotations/${quotation.id}`, payload)
-        : await post('/quotations', payload, { idempotencyKey: `quote-${selectedLead}-${title}-${totals.total}` });
+        : await post('/quotations', payload, { idempotencyKey: requestId.current });
       toast.success(quotation ? 'Quotation updated.' : 'Quotation created.');
       onSaved(result.quotation);
     } catch (err) {

@@ -60,7 +60,9 @@ export function hasFeature(orgId: string, feature: string): boolean {
 export function requireFeature(orgId: string, feature: string, label: string): void {
   const sub = getSubscription(orgId);
   if (sub.features.includes(feature)) return;
-  const upgrade = (Object.keys(PLANS) as PlanKey[]).find((key) => (PLANS[key].features as readonly string[]).includes(feature));
+  // Never suggest "upgrade to Trial" — recommend the cheapest paid plan that has it.
+  const upgrade = (['starter', 'growth', 'pro'] as PlanKey[])
+    .find((key) => (PLANS[key].features as readonly string[]).includes(feature));
   throw limitReached(
     `${label} is not included in the ${PLANS[sub.plan].name} plan.${upgrade ? ` Upgrade to ${PLANS[upgrade].name} to enable it.` : ''}`,
     { feature, current_plan: sub.plan, upgrade_to: upgrade },

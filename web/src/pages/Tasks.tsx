@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { get, post } from '../lib/api';
+import { get, newRequestId, post } from '../lib/api';
 import { useSession } from '../lib/session';
 import {
   Avatar, Badge, Button, Card, EmptyState, ErrorBlock, Icon, LoadingBlock, Modal,
@@ -253,6 +253,9 @@ function NewTaskDialog({ onClose, onSaved }: { onClose: () => void; onSaved: () 
     enabled: debounced.trim().length >= 2,
   });
 
+  // One key per open dialog — see newRequestId.
+  const requestId = useRef(newRequestId());
+
   return (
     <Modal
       title="New task" onClose={onClose}
@@ -267,7 +270,7 @@ function NewTaskDialog({ onClose, onSaved }: { onClose: () => void; onSaved: () 
                 await post('/tasks', {
                   title, type, priority, due_at: fromInputDateTime(dueAt),
                   lead_id: leadId || undefined,
-                }, { idempotencyKey: `task-${title}-${dueAt}` });
+                }, { idempotencyKey: requestId.current });
                 toast.success('Task created.');
                 onSaved();
               } catch (err) { toast.error(err); } finally { setSaving(false); }

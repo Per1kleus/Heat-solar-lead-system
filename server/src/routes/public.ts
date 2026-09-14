@@ -137,6 +137,10 @@ publicRouter.post(
         notes: body.notes,
         project_types: body.project_types,
         campaign: body.campaign,
+        // Someone who filled in "Request a quotation" has asked for a price. That
+        // is the strongest early qualifier there is, so record it rather than
+        // waiting until we have sent one.
+        requested_quote: 1,
         consent_marketing: body.consent_marketing ? 1 : 0,
         gdpr_basis: 'consent_request',
         utm: body.utm ?? {},
@@ -243,6 +247,7 @@ publicRouter.post(
       estimated_value: z.number().optional(),
       notes: z.string().optional(),
       consent_marketing: z.boolean().optional(),
+      requested_quote: z.boolean().optional(),
       fields: z.record(z.any()).optional(),
       utm: z.record(z.string()).optional(),
     }).parse(req.body);
@@ -257,6 +262,7 @@ publicRouter.post(
         ...body,
         ...(body.fields ?? {}),
         consent_marketing: body.consent_marketing ? 1 : 0,
+        requested_quote: body.requested_quote ? 1 : 0,
         intake_payload: body,
       },
       { orgId: org.id, channel: 'api', sourceKey, allowDuplicate: true, ip: req.ip },

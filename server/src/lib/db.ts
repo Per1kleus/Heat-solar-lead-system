@@ -13,6 +13,27 @@ db.exec('PRAGMA synchronous = NORMAL');
 export function applySchema(): void {
   const schemaPath = path.join(import.meta.dirname, '../db/schema.sql');
   db.exec(fs.readFileSync(schemaPath, 'utf8'));
+  addMissingColumns();
+}
+
+/**
+ * CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a column added to
+ * the schema after a database was created would never appear. Each entry here is
+ * one such column, added exactly once; the schema file stays the single source of
+ * truth for a fresh install.
+ */
+const ADDED_COLUMNS: { table: string; column: string; definition: string }[] = [
+  { table: 'leads', column: 'requested_quote', definition: 'INTEGER NOT NULL DEFAULT 0' },
+];
+
+function addMissingColumns(): void {
+  for (const { table, column, definition } of ADDED_COLUMNS) {
+    const exists = db
+      .prepare(`SELECT 1 FROM pragma_table_info(?) WHERE name = ?`)
+      .get(table, column);
+    if (exists) continue;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
 }
 
 export type Row = Record<string, any>;

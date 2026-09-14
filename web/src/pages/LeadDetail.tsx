@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { get, post, patch } from '../lib/api';
+import { get, newRequestId, post, patch } from '../lib/api';
 import { useSession } from '../lib/session';
 import {
   Avatar, Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBlock, Icon, LoadingBlock,
@@ -883,6 +883,10 @@ function TaskDialog({ leadId, defaultAssignee, onClose, onSaved }: { leadId: str
   const [saving, setSaving] = useState(false);
   const toast = useToast();
 
+  // One key per open dialog: a double-click cannot create two tasks, while an
+  // identical follow-up scheduled again later still can be.
+  const requestId = useRef(newRequestId());
+
   const save = async () => {
     setSaving(true);
     try {
@@ -890,7 +894,7 @@ function TaskDialog({ leadId, defaultAssignee, onClose, onSaved }: { leadId: str
         lead_id: leadId, title, type, priority,
         due_at: fromInputDateTime(dueAt), description: description || undefined,
         assignee_id: defaultAssignee,
-      }, { idempotencyKey: `task-${leadId}-${dueAt}-${title}` });
+      }, { idempotencyKey: requestId.current });
       toast.success('Follow-up scheduled.');
       onSaved(); onClose();
     } catch (err) { toast.error(err); } finally { setSaving(false); }

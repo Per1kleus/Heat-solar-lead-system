@@ -4,7 +4,8 @@ import { processDueRuns } from '../lib/automation.ts';
 import { emit } from '../lib/events.ts';
 import { notify } from '../lib/notify.ts';
 import { config } from '../lib/config.ts';
-import { money } from '../lib/leads.ts';
+import { audit } from '../lib/audit.ts';
+import { money, rescoreLead } from '../lib/leads.ts';
 
 /**
  * One periodic tick drives everything time-based: automation steps that have come
@@ -21,11 +22,13 @@ export function startScheduler(): { stop: () => void } {
       processDueRuns();
       sweepOverdueTasks();
       sweepIdleLeads();
+      sweepStaleScores();
       sweepLeadsWithoutNextAction();
       sweepExpiringQuotations();
       sweepUpcomingAppointments();
       sweepLostRecovery();
       cleanupIdempotencyKeys();
+      applyRetentionDaily();
     } catch (err) {
       console.error('[scheduler] tick failed', err);
     } finally {
@@ -86,6 +89,31 @@ function sweepIdleLeads(): void {
         });
       }
       emit({ type: 'lead_idle', orgId: org.id, leadId: lead.id });
+    }
+  }
+}
+
+/**
+ * Score decay. The staleness and unreachable penalties fire on the ABSENCE of
+ * activity, so nothing else would ever recalculate them: a lead nobody touches
+ * would keep the score it earned on the day it arrived. This sweep re-scores the
+ * open leads with the oldest scores, which is what makes a forgotten hot lead
+ * cool down and cross back into the temperature the sales manager should see.
+ */
+function sweepStaleScores(): void {
+  const cutoff = addMinutes(new Date(), -12 * 60);
+  const leads = all<{ id: string; org_id: string }>(
+    `SELECT id, org_id FROM leads
+     WHERE status = 'open' AND deleted_at IS NULL AND (scored_at IS NULL OR scored_at < ?)
+     ORDER BY scored_at IS NULL DESC, scored_at
+     LIMIT 100`,
+    [cutoff],
+  );
+  for (const lead of leads) {
+    try {
+      rescoreLead(lead.org_id, lead.id, { touch: false });
+    } catch (err) {
+      console.error('[scheduler] could not rescore', lead.id, err);
     }
   }
 }
@@ -189,6 +217,20 @@ function cleanupIdempotencyKeys(): void {
   run('DELETE FROM notifications WHERE created_at < ? AND read_at IS NOT NULL', [addDays(new Date(), -60)]);
 }
 
+/**
+ * Retention is a promise to the people in the database, so it has to actually
+ * run — once a day is enough, and a repeat after a restart is harmless because
+ * the sweep is idempotent.
+ */
+let retentionRanOn = '';
+function applyRetentionDaily(): void {
+  const today = new Date().toISOString().slice(0, 10);
+  if (retentionRanOn === today) return;
+  retentionRanOn = today;
+  const deleted = applyRetention();
+  if (deleted > 0) console.log(`[scheduler] retention removed ${deleted} lost lead(s)`);
+}
+
 /** Applies each organisation's retention policy (0 = keep indefinitely). */
 export function applyRetention(): number {
   const orgs = all<{ id: string; retention_months: number }>(
@@ -205,6 +247,13 @@ export function applyRetention(): number {
     for (const lead of stale) {
       run('UPDATE leads SET deleted_at = ? WHERE id = ?', [nowIso(), lead.id]);
       deleted += 1;
+    }
+    if (stale.length > 0) {
+      audit({
+        orgId: org.id, actorLabel: 'retention policy', action: 'retention.applied',
+        entityType: 'lead', entityLabel: `${stale.length} lost lead(s) older than ${org.retention_months} months`,
+        changes: { retention_months: org.retention_months, removed: stale.length },
+      });
     }
   }
   return deleted;

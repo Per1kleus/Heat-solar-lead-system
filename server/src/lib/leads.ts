@@ -51,6 +51,7 @@ export function shapeLead(lead: any): any {
     hp_removal_required: !!lead.hp_removal_required,
     pv_existing_system: !!lead.pv_existing_system,
     budget_known: !!lead.budget_known,
+    requested_quote: !!lead.requested_quote,
     automation_paused: !!lead.automation_paused,
     consent_marketing: !!lead.consent_marketing,
     has_next_action: Boolean(lead.next_task_id),
@@ -231,7 +232,11 @@ export function matchCondition(lead: Record<string, any>, c: { field: string; op
 
 // --- scoring and next action --------------------------------------------
 
-export function rescoreLead(orgId: string, leadId: string, options: { silent?: boolean } = {}): ScoreResult {
+export function rescoreLead(
+  orgId: string,
+  leadId: string,
+  options: { silent?: boolean; touch?: boolean } = {},
+): ScoreResult {
   const lead = get<any>(
     `SELECT l.*, s.key AS source_key, s.name AS source_name FROM leads l
      LEFT JOIN lead_sources s ON s.id = l.source_id WHERE l.id = ? AND l.org_id = ?`,
@@ -241,10 +246,18 @@ export function rescoreLead(orgId: string, leadId: string, options: { silent?: b
   const signals = gatherSignals(orgId, leadId, lead.last_activity_at);
   const result = computeScore(lead, loadRules(orgId), signals);
   const previousTemp = lead.temperature;
+  // The scheduled decay sweep passes touch: false — a score that fell because
+  // nobody did anything is not an edit, and must not push the lead to the top of
+  // "recently updated".
+  const touch = options.touch !== false;
   run(
-    `UPDATE leads SET score = ?, temperature = ?, score_breakdown = ?, scored_at = ?, updated_at = ?
+    `UPDATE leads SET score = ?, temperature = ?, score_breakdown = ?, scored_at = ?${touch ? ', updated_at = ?' : ''}
      WHERE id = ? AND org_id = ?`,
-    [result.score, result.temperature, JSON.stringify(result.breakdown), nowIso(), nowIso(), leadId, orgId],
+    [
+      result.score, result.temperature, JSON.stringify(result.breakdown), nowIso(),
+      ...(touch ? [nowIso()] : []),
+      leadId, orgId,
+    ],
   );
   if (!options.silent && previousTemp !== result.temperature) {
     logActivity({
@@ -288,6 +301,13 @@ export interface ActivityInput {
   occurredAt?: string;
   /** Marks real contact with the customer: drives last-activity and sequence stops. */
   isCustomerTouch?: boolean;
+  /**
+   * Whether this entry counts as something happening on the lead. A recalculated
+   * score must not: the staleness penalty fires on the absence of activity, so
+   * letting the resulting timeline entry reset the clock would make a forgotten
+   * lead look busy and immediately undo its own decay.
+   */
+  advancesActivity?: boolean;
 }
 
 export function logActivity(input: ActivityInput): string {
@@ -313,9 +333,12 @@ export function logActivity(input: ActivityInput): string {
     created_at: nowIso(),
   });
   if (input.leadId) {
-    run('UPDATE leads SET last_activity_at = ?, updated_at = ? WHERE id = ? AND org_id = ?', [
-      occurredAt, nowIso(), input.leadId, input.orgId,
-    ]);
+    const advances = input.advancesActivity ?? input.type !== 'score';
+    if (advances) {
+      run('UPDATE leads SET last_activity_at = ?, updated_at = ? WHERE id = ? AND org_id = ?', [
+        occurredAt, nowIso(), input.leadId, input.orgId,
+      ]);
+    }
     if (input.isCustomerTouch) {
       const lead = get<{ first_contacted_at: string | null }>(
         'SELECT first_contacted_at FROM leads WHERE id = ? AND org_id = ?', [input.leadId, input.orgId],
@@ -352,7 +375,7 @@ export interface CreateLeadOptions {
 const LEAD_COLUMNS = new Set([
   'first_name', 'last_name', 'company', 'phone', 'email', 'address', 'city', 'postal_code', 'region',
   'preferred_contact', 'notes', 'campaign', 'estimated_value', 'probability', 'expected_close_date',
-  'urgency', 'budget_known', 'budget_amount', 'consent_marketing', 'gdpr_basis',
+  'urgency', 'budget_known', 'budget_amount', 'requested_quote', 'consent_marketing', 'gdpr_basis',
   'pv_interest', 'pv_existing_system', 'pv_desired_kwp', 'pv_annual_kwh', 'pv_monthly_bill', 'pv_roof_type',
   'pv_roof_orientation', 'pv_roof_area_m2', 'pv_roof_tilt', 'pv_shading', 'pv_property_type', 'pv_phase',
   'pv_grid_connection', 'pv_meter_number', 'pv_install_location', 'battery_interest', 'battery_kwh',

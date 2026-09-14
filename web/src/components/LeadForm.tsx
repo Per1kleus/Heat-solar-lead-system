@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { get, post } from '../lib/api';
+import { get, newRequestId, post } from '../lib/api';
 import { useSession } from '../lib/session';
 import { Badge, Button, Field, Icon, Modal, useDebounced, useToast } from './ui';
 import { ApiError } from '../lib/api';
@@ -32,6 +32,7 @@ export default function LeadForm({
     address: '', city: '', postal_code: '', preferred_contact: 'phone', notes: '',
     source_key: 'manual', campaign: '', owner_id: '', estimated_value: '',
     expected_close_date: '', urgency: 'unknown', budget_known: false, budget_amount: '',
+    requested_quote: false,
     consent_marketing: false,
     ...numericBlank(initial),
   }));
@@ -75,6 +76,10 @@ export default function LeadForm({
 
   const fieldError = (path: string) => error?.fieldError(path);
 
+  // One key per open form: a double-submit cannot create two leads, while a
+  // second genuine enquiry from the same person still can be recorded.
+  const requestId = useRef(newRequestId());
+
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     setError(null);
@@ -91,7 +96,7 @@ export default function LeadForm({
         allow_duplicate: forceCreate || duplicates.length === 0,
       };
       const result = mode === 'create'
-        ? await post('/leads', payload, { idempotencyKey: `lead-${Date.now()}-${Math.random().toString(36).slice(2)}` })
+        ? await post('/leads', payload, { idempotencyKey: requestId.current })
         : await post(`/leads/${initial.id}`, payload, { method: 'PATCH' } as any);
       toast.success(mode === 'create' ? 'Lead created.' : 'Lead saved.');
       onSaved(result.lead);
@@ -217,6 +222,10 @@ export default function LeadForm({
             </Field>
           </div>
           <div className="grid c2 mt-4">
+            <label className="check">
+              <input type="checkbox" checked={!!form.requested_quote} onChange={set('requested_quote')} />
+              <span>Asked us for a quotation</span>
+            </label>
             <label className="check">
               <input type="checkbox" checked={!!form.budget_known} onChange={set('budget_known')} />
               <span>Budget discussed</span>
@@ -427,7 +436,8 @@ function numericBlank(initial?: any): Record<string, any> {
 const ALLOWED = new Set([
   'first_name', 'last_name', 'company', 'phone', 'email', 'address', 'city', 'postal_code',
   'preferred_contact', 'notes', 'source_key', 'campaign', 'owner_id', 'estimated_value',
-  'expected_close_date', 'urgency', 'budget_known', 'budget_amount', 'consent_marketing',
+  'expected_close_date', 'urgency', 'budget_known', 'budget_amount', 'requested_quote',
+  'consent_marketing',
   ...NUMERIC_KEYS,
   'pv_roof_type', 'pv_roof_orientation', 'pv_shading', 'pv_property_type', 'pv_phase',
   'pv_grid_connection', 'pv_meter_number', 'pv_install_location', 'pv_existing_system',

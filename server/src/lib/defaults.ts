@@ -279,9 +279,14 @@ export const DEFAULT_PRODUCTS = [
 
 export const PLANS = {
   trial: {
+    // The trial deliberately mirrors Growth so a company can evaluate the whole
+    // product, plus AI so the optional features can be judged too.
     key: 'trial', name: 'Trial', price_eur: 0, seats: 3, lead_limit: 100,
-    features: ['pipeline', 'quotations', 'automation_basic', 'analytics', 'site_surveys', 'ai'],
-    description: '14 days, full Growth feature set.',
+    features: [
+      'pipeline', 'quotations', 'automation_basic', 'automation_advanced',
+      'analytics', 'site_surveys', 'integrations', 'ai',
+    ],
+    description: '14 days with the full Growth feature set, plus AI.',
   },
   starter: {
     key: 'starter', name: 'Starter', price_eur: 79, seats: 2, lead_limit: 250,

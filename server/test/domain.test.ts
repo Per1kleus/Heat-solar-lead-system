@@ -181,6 +181,32 @@ describe('lead scoring', () => {
     assert.ok(result.breakdown.some((f) => f.key === 'multi_product'));
   });
 
+  test('asking for a price scores before we have sent one', () => {
+    const rules = loadRules(orgA);
+    const signals = {
+      quotesSent: 0, customerReplies: 0, outboundAttempts: 0, failedAttempts: 0,
+      surveysBooked: 0, appointmentsBooked: 0, hoursSinceActivity: 0,
+    };
+    const base = { org_id: orgA, status: 'open', project_types: '["pv"]', estimated_value: 0 };
+    const asked = computeScore({ ...base, requested_quote: 1 }, rules, signals);
+    const didNot = computeScore(base, rules, signals);
+    const factor = asked.breakdown.find((f) => f.key === 'requested_quote');
+    assert.ok(factor, 'an enquiry that asked for a price must score for it');
+    assert.equal(asked.score - didNot.score, factor!.points);
+  });
+
+  test('the website form records that a price was requested', () => {
+    const { lead } = createLead(
+      {
+        first_name: 'Asked', last_name: 'ForPrice', phone: '+30 691 000 0077',
+        project_types: ['pv'], requested_quote: 1,
+      },
+      { orgId: orgA, userId: userA, skipAutomation: true, allowDuplicate: true },
+    );
+    assert.equal(shapeLead(loadLead(orgA, lead.id)).requested_quote, true);
+    assert.ok(rescoreLead(orgA, lead.id).breakdown.some((f) => f.key === 'requested_quote'));
+  });
+
   test('the temperature follows the documented bands', () => {
     const rules = loadRules(orgA);
     const base = { org_id: orgA, id: 'x', status: 'open', project_types: '[]', estimated_value: 0 };
@@ -210,6 +236,39 @@ describe('lead scoring', () => {
     const hp = countCompleteness({ project_types: '["heat_pump"]', hp_interest: 1, phone: '123' });
     assert.ok(hp.missing.includes('insulation condition'));
     assert.ok(!hp.missing.includes('roof orientation'));
+  });
+
+  test('a forgotten lead cools down, and the decay is not an edit', () => {
+    const { lead } = createLead(
+      {
+        first_name: 'Forgotten', last_name: 'Lead', phone: '+30 691 000 0099', email: 'f@test.gr',
+        project_types: ['pv'], estimated_value: 14000, urgency: 'immediate',
+        pv_annual_kwh: 12000, pv_monthly_bill: 190, pv_roof_type: 'tile',
+        pv_roof_orientation: 'S', pv_roof_area_m2: 70, pv_phase: 'three',
+        pv_property_type: 'detached', address: 'Somewhere 2', city: 'Athens',
+      },
+      { orgId: orgA, userId: userA, skipAutomation: true, allowDuplicate: true },
+    );
+    const fresh = rescoreLead(orgA, lead.id);
+    assert.ok(!fresh.breakdown.some((f) => f.key === 'stale'), 'a new lead is not stale');
+
+    // Nobody touches it for a month. Staleness fires on the ABSENCE of activity,
+    // so only the scheduled sweep can ever apply it.
+    const monthAgo = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+    const before = get<{ updated_at: string }>('SELECT updated_at FROM leads WHERE id = ?', [lead.id])!;
+    run('UPDATE leads SET last_activity_at = ? WHERE id = ?', [monthAgo, lead.id]);
+
+    const decayed = rescoreLead(orgA, lead.id, { touch: false });
+    const staleFactor = decayed.breakdown.find((f) => f.key === 'stale');
+    assert.ok(staleFactor, 'the staleness penalty must appear in the breakdown');
+    assert.ok(staleFactor!.points < 0);
+    assert.ok(decayed.score < fresh.score, `expected the score to fall from ${fresh.score}, got ${decayed.score}`);
+
+    const after = get<{ updated_at: string; scored_at: string }>(
+      'SELECT updated_at, scored_at FROM leads WHERE id = ?', [lead.id],
+    )!;
+    assert.equal(after.updated_at, before.updated_at, 'a decayed score must not count as an edit');
+    assert.ok(after.scored_at > monthAgo, 'the lead must be marked as freshly scored');
   });
 
   test('an inactive scoring rule stops contributing', () => {

@@ -265,6 +265,8 @@ export default function ImportLeads() {
             </div>
           )}
 
+          {preview.preview.length > 0 ? (
+            <>
           <h3 className="mb-2">First rows that will be created</h3>
           <div className="table-wrap">
             <table className="data">
@@ -286,6 +288,13 @@ export default function ImportLeads() {
               </tbody>
             </table>
           </div>
+            </>
+          ) : (
+            <div className="banner info">
+              <Icon name="dot" size={15} />
+              <span>Nothing in this file would be created. Fix the rows above, or go back and check the column mapping.</span>
+            </div>
+          )}
         </Card>
       )}
 
