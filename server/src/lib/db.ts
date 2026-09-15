@@ -30,6 +30,10 @@ const ADDED_COLUMNS: { table: string; column: string; definition: string }[] = [
   { table: 'appointments', column: 'reminder_sent_at', definition: 'TEXT' },
   { table: 'automation_runs', column: 'appointment_id', definition: 'TEXT' },
   { table: 'automation_runs', column: 'run_key', definition: 'TEXT' },
+  { table: 'automation_runs', column: 'paused_at', definition: 'TEXT' },
+  { table: 'messages', column: 'dedupe_key', definition: 'TEXT' },
+  { table: 'messages', column: 'attempts', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'quotations', column: 'last_viewed_at', definition: 'TEXT' },
 ];
 
 function addMissingColumns(): void {

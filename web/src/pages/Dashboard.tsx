@@ -9,6 +9,8 @@ import {
 import { money, moneyShort, relative, isOverdue, time, projectTypeLabel, percent } from '../lib/format';
 import LeadComposer from '../components/LeadComposer';
 import AppointmentOutcome from '../components/AppointmentOutcome';
+import LeadAppointmentDialog from '../components/LeadAppointmentDialog';
+import QuotationBuilder from '../components/QuotationBuilder';
 
 export default function Dashboard() {
   const { user, organization } = useSession();
@@ -37,22 +39,23 @@ export default function Dashboard() {
   const k = data.kpis;
   const hour = new Date().getHours();
 
-  /** Do the thing from here when that is practical; otherwise open the record. */
+  /**
+   * Do the thing from here rather than navigating, wherever the dialog that does
+   * it can be opened with what the item already carries. Only the two cases that
+   * genuinely need the whole record — assigning an owner and opening a job —
+   * still navigate.
+   */
+  const INLINE = new Set([
+    'contact', 'follow_up', 'close_appointment', 'create_quote', 'schedule_installation', 'view_appointment',
+  ]);
   const act = (item: any) => {
-    if ((item.action === 'contact' || item.action === 'follow_up') && item.lead_id) {
+    if (INLINE.has(item.action) && (item.lead_id || item.appointment_id)) {
       setActing(item);
-      return;
-    }
-    if (item.action === 'close_appointment' && item.appointment_id) {
-      setActing(item);
-      return;
-    }
-    if (item.action === 'create_quote' && item.lead_id) {
-      navigate(`/app/quotations?new=1&lead_id=${item.lead_id}&survey_id=${item.survey_id}`);
       return;
     }
     navigate(item.link);
   };
+  const done = () => { setActing(null); refetch(); };
   const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
 
   return (
@@ -79,20 +82,6 @@ export default function Dashboard() {
         currency={currency}
         onAct={act}
       />
-
-      {/* ---- KPIs ---- */}
-      <div className="kpi-grid mt-6">
-        <Kpi label="New leads today" value={k.new_leads_today} sub={`${k.new_leads_week} this week`} onClick={() => navigate('/app/leads?sort=created_at')} />
-        <Kpi label="Follow-ups due today" value={k.follow_ups_due_today} tone={k.follow_ups_due_today > 0 ? 'warn' : undefined} onClick={() => navigate('/app/tasks?bucket=today')} />
-        <Kpi label="Overdue follow-ups" value={k.overdue_follow_ups} tone={k.overdue_follow_ups > 0 ? 'alert' : 'good'} onClick={() => navigate('/app/tasks?bucket=overdue')} />
-        <Kpi label="Quotes awaiting a response" value={k.quotes_awaiting} sub={money(k.quotes_awaiting_value, currency)} tone={k.quotes_awaiting > 0 ? 'warn' : undefined} onClick={() => navigate('/app/quotations?status=sent,viewed,awaiting_response')} />
-        <Kpi label="Hot leads" value={k.hot_leads} tone={k.hot_leads > 0 ? 'alert' : undefined} onClick={() => navigate('/app/leads?temperature=hot')} />
-        <Kpi label="Won this month" value={k.won_this_month} sub={money(k.revenue_this_month, currency)} tone="good" onClick={() => navigate('/app/leads?status=won')} />
-        <Kpi label="Lost this month" value={k.lost_this_month} onClick={() => navigate('/app/leads?status=lost')} />
-        <Kpi label="Conversion rate" value={percent(k.conversion_rate, 1)} sub="won of decided deals" />
-        <Kpi label="Pipeline value" value={moneyShort(k.pipeline_value, currency)} sub={`${k.open_leads} open leads`} onClick={() => navigate('/app/pipeline')} />
-        <Kpi label="Expected revenue" value={moneyShort(k.expected_revenue, currency)} sub="weighted by stage probability" onClick={() => navigate('/app/analytics?tab=forecast')} />
-      </div>
 
       <div className="grid c2 mt-6" style={{ alignItems: 'start' }}>
         {/* ---- my queue: who do I contact, why, when, how much, what happened ---- */}
@@ -208,17 +197,33 @@ export default function Dashboard() {
         </div>
       </div>
 
+      {/* ---- how the business is doing: below the work, deliberately ---- */}
+      <h2 className="mt-6 mb-2" style={{ fontSize: 15 }}>Business performance</h2>
+      <div className="kpi-grid">
+        <Kpi label="New leads today" value={k.new_leads_today} sub={`${k.new_leads_week} this week`} onClick={() => navigate('/app/leads?sort=created_at')} />
+        <Kpi label="Follow-ups due today" value={k.follow_ups_due_today} tone={k.follow_ups_due_today > 0 ? 'warn' : undefined} onClick={() => navigate('/app/tasks?bucket=today')} />
+        <Kpi label="Overdue follow-ups" value={k.overdue_follow_ups} tone={k.overdue_follow_ups > 0 ? 'alert' : 'good'} onClick={() => navigate('/app/tasks?bucket=overdue')} />
+        <Kpi label="Quotes awaiting a response" value={k.quotes_awaiting} sub={money(k.quotes_awaiting_value, currency)} tone={k.quotes_awaiting > 0 ? 'warn' : undefined} onClick={() => navigate('/app/quotations?status=sent,viewed,awaiting_response')} />
+        <Kpi label="Hot leads" value={k.hot_leads} tone={k.hot_leads > 0 ? 'alert' : undefined} onClick={() => navigate('/app/leads?temperature=hot')} />
+        <Kpi label="Won this month" value={k.won_this_month} sub={money(k.revenue_this_month, currency)} tone="good" onClick={() => navigate('/app/leads?status=won')} />
+        <Kpi label="Lost this month" value={k.lost_this_month} onClick={() => navigate('/app/leads?status=lost')} />
+        <Kpi label="Conversion rate" value={percent(k.conversion_rate, 1)} sub="won of decided deals" />
+        <Kpi label="Pipeline value" value={moneyShort(k.pipeline_value, currency)} sub={`${k.open_leads} open leads`} onClick={() => navigate('/app/pipeline')} />
+        <Kpi label="Expected revenue" value={moneyShort(k.expected_revenue, currency)} sub="weighted by stage probability" onClick={() => navigate('/app/analytics?tab=forecast')} />
+      </div>
+
       {acting && (acting.action === 'contact' || acting.action === 'follow_up') && (
         <LeadComposer
           leadId={acting.lead_id}
           channel="whatsapp"
-          templateKey={acting.action === 'follow_up' ? 'quote_follow_up' : undefined}
+          templateKey={acting.template_key ?? undefined}
           quotationId={acting.quotation_id ?? undefined}
+          appointmentId={acting.appointment_id ?? undefined}
           onClose={() => setActing(null)}
-          onSent={() => { setActing(null); refetch(); }}
+          onSent={done}
         />
       )}
-      {acting && acting.action === 'close_appointment' && (
+      {acting && (acting.action === 'close_appointment' || acting.action === 'view_appointment') && (
         <AppointmentOutcome
           appointment={{
             id: acting.appointment_id,
@@ -226,7 +231,23 @@ export default function Dashboard() {
             starts_at: acting.due_at,
           }}
           onClose={() => setActing(null)}
-          onSaved={() => { setActing(null); refetch(); }}
+          onSaved={done}
+        />
+      )}
+      {acting && acting.action === 'create_quote' && (
+        <QuotationBuilder
+          leadId={acting.lead_id}
+          surveyId={acting.survey_id ?? undefined}
+          onClose={() => setActing(null)}
+          onSaved={(quote: any) => { setActing(null); navigate(`/app/quotations/${quote.id}`); }}
+        />
+      )}
+      {acting && acting.action === 'schedule_installation' && (
+        <LeadAppointmentDialog
+          leadId={acting.lead_id}
+          defaultType="installation"
+          onClose={() => setActing(null)}
+          onSaved={done}
         />
       )}
     </div>
@@ -234,6 +255,7 @@ export default function Dashboard() {
 }
 
 const KIND_META: Record<string, { mark: string; group: string }> = {
+  installation_unscheduled: { mark: '🗓', group: 'Won jobs not scheduled' },
   overdue_task: { mark: '🔴', group: 'Overdue follow-ups' },
   appointment_missed: { mark: '📵', group: 'Appointments not closed off' },
   hot_lead: { mark: '🔥', group: 'Hot leads going quiet' },
@@ -271,10 +293,11 @@ function ActionPanel({
         <div className="row gap-6">
           <span style={{ color: 'var(--good)' }}><Icon name="check" size={22} /></span>
           <div>
-            <h2>Nothing needs your attention</h2>
+            <h2>You're all caught up</h2>
             <p className="small muted" style={{ margin: 0 }}>
-              No overdue follow-ups, no unanswered quotations, every survey quoted and every open
-              lead has a next action. Well played.
+              No overdue follow-ups, no unanswered quotations, every survey quoted, every visit
+              closed off and every open lead has a next action. What is coming up and how the
+              business is doing are below.
             </p>
           </div>
         </div>
@@ -333,9 +356,17 @@ function ActionPanel({
               <div className="row gap-4" style={{ minWidth: 0 }}>
                 <span className="strong truncate">{item.name}</span>
                 {item.priority === 1 && <Badge tone="danger">Now</Badge>}
+                {item.temperature && <TemperatureBadge temperature={item.temperature} />}
               </div>
               <div className="small truncate" style={{ color: 'var(--ink-2)' }}>{item.reason}</div>
               {item.context && <div className="tiny dim truncate">{item.context}</div>}
+              {item.next_automated_at && (
+                // The automation and the dashboard read the same data, so the
+                // owner can see a chase is already booked and skip it.
+                <div className="tiny truncate" style={{ color: 'var(--accent-ink)' }}>
+                  ⤷ Automated follow-up scheduled {relative(item.next_automated_at)}
+                </div>
+              )}
             </button>
             <div className="right nowrap" style={{ minWidth: 0 }}>
               {item.value ? <div className="small strong">{money(item.value, currency)}</div> : null}

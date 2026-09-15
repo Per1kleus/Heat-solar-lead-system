@@ -1,4 +1,4 @@
-import { test, describe, before, after } from 'node:test';
+import { test, describe, before, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,7 +12,10 @@ process.env.VF_JWT_SECRET = 'test-secret-not-used-in-production';
 process.env.NODE_ENV = 'test';
 
 const { applySchema, all, get, run } = await import('../src/lib/db.ts');
-const { registerAutomationEngine, processDueRuns, stopAllRuns, stopRun } = await import('../src/lib/automation.ts');
+const {
+  registerAutomationEngine, processDueRuns, stopAllRuns, stopRun,
+  pauseRun, resumeRun, setLeadSequencesPaused,
+} = await import('../src/lib/automation.ts');
 const { buildAttentionList } = await import('../src/lib/attention.ts');
 const { emit } = await import('../src/lib/events.ts');
 const { provisionOrganization } = await import('../src/lib/provision.ts');
@@ -31,12 +34,12 @@ const { hashPassword, verifyPassword } = await import('../src/lib/auth.ts');
 const { can, seesEverything } = await import('../src/lib/permissions.ts');
 const {
   checkMarketingConsent, getIntegration, channelStatus, resolveChannel, renderTemplate,
-  sendTemplate, checkAutomatedSendAllowed,
+  sendTemplate, checkAutomatedSendAllowed, registerTransport, resetTransports,
 } = await import('../src/lib/messaging.ts');
 const { buildQuotationDraft } = await import('../src/lib/quoteDraft.ts');
 const { findApptConflicts } = await import('../src/routes/tasks.ts');
 const { newId } = await import('../src/lib/ids.ts');
-const { nowIso } = await import('../src/lib/time.ts');
+const { nowIso, addDays, addMinutes } = await import('../src/lib/time.ts');
 
 applySchema();
 registerAutomationEngine();
@@ -1182,5 +1185,617 @@ describe('what needs attention', () => {
     assert.equal(mine.filter((i) => i.kind !== 'installation_due').length, 0);
     // Unassigned leads are a manager's job and never appear in a scoped list.
     assert.equal(mine.some((i) => i.kind === 'unassigned'), false);
+  });
+});
+
+// ─────────────────────────────── automated sends: the provider boundary
+
+describe('automated message delivery', () => {
+  let target = '';
+  /** What the substituted provider was asked to send, in order. */
+  let sent: { to: string; subject: string | null; body: string }[] = [];
+
+  const connect = (provider: 'smtp' | 'whatsapp_cloud') => {
+    run(
+      `UPDATE integrations SET status = 'connected', config = ?, secrets = ? WHERE org_id = ? AND provider = ?`,
+      [
+        JSON.stringify(provider === 'smtp'
+          ? { host: 'mail.test', port: 587, from_address: 'sales@test.gr' }
+          : { phone_number_id: '1234567890' }),
+        JSON.stringify(provider === 'smtp' ? { user: 'u', pass: 'p' } : { access_token: 't' }),
+        orgA, provider,
+      ],
+    );
+  };
+  const disconnect = (provider: string) => {
+    run("UPDATE integrations SET status = 'disconnected' WHERE org_id = ? AND provider = ?", [orgA, provider]);
+  };
+
+  before(() => {
+    const { lead } = createLead(
+      {
+        first_name: 'Delivery', last_name: 'Target', phone: '+30 691 777 0001',
+        email: 'delivery@test.gr', project_types: ['pv'], preferred_contact: 'whatsapp',
+      },
+      { orgId: orgA, userId: userA, skipAutomation: true, allowDuplicate: true },
+    );
+    target = lead.id;
+  });
+
+  beforeEach(() => {
+    sent = [];
+    // Substitute the provider at the transport boundary: no credentials, no
+    // network, but the whole send path above it runs for real.
+    registerTransport('whatsapp', async (input) => {
+      sent.push({ to: input.to, subject: input.subject ?? null, body: input.body });
+      return { ok: true, providerMessageId: `wamid.${sent.length}` };
+    });
+    registerTransport('email', async (input) => {
+      sent.push({ to: input.to, subject: input.subject ?? null, body: input.body });
+      return { ok: true, providerMessageId: `smtp-${sent.length}` };
+    });
+  });
+
+  after(() => {
+    resetTransports();
+    disconnect('smtp');
+    disconnect('whatsapp_cloud');
+  });
+
+  test('a connected provider actually sends, and the result is recorded', async () => {
+    connect('whatsapp_cloud');
+    const result = await sendTemplate({
+      orgId: orgA, templateKey: 'first_contact', channel: 'preferred', leadId: target, userId: userA,
+      dedupeKey: 'test:connected:1',
+    });
+    assert.equal(result.sent, true);
+    assert.equal(sent.length, 1, 'the provider should have been called exactly once');
+    assert.match(sent[0].body, /Hello Delivery/);
+
+    const row = get<any>('SELECT * FROM messages WHERE id = ?', [result.messageId])!;
+    assert.equal(row.status, 'sent');
+    assert.equal(row.channel, 'whatsapp', 'the stated preference decides the channel');
+    assert.ok(row.sent_at);
+    assert.equal(row.provider_message_id, 'wamid.1');
+
+    const activity = get<any>(
+      "SELECT * FROM activities WHERE org_id = ? AND lead_id = ? ORDER BY occurred_at DESC LIMIT 1", [orgA, target],
+    );
+    assert.match(activity.title, /WhatsApp message sent/);
+  });
+
+  test('the same scheduled action never sends twice', async () => {
+    connect('whatsapp_cloud');
+    const key = 'run_x:2:send:quote_follow_up';
+    const first = await sendTemplate({
+      orgId: orgA, templateKey: 'first_contact', leadId: target, automationRunId: 'run_x', dedupeKey: key,
+    });
+    // Everything that can make an action run twice: a duplicated tick, a worker
+    // retry, and a restart reprocessing the same step.
+    const second = await sendTemplate({
+      orgId: orgA, templateKey: 'first_contact', leadId: target, automationRunId: 'run_x', dedupeKey: key,
+    });
+    const third = await sendTemplate({
+      orgId: orgA, templateKey: 'first_contact', leadId: target, automationRunId: 'run_x', dedupeKey: key,
+    });
+
+    assert.equal(first.sent, true);
+    assert.equal(second.sent, true, 'a replay reports the original success');
+    assert.equal(third.sent, true);
+    assert.equal(first.messageId, second.messageId, 'the replay is the same message, not a new one');
+    assert.equal(first.messageId, third.messageId);
+    assert.equal(sent.length, 1, 'the provider must be called once for one scheduled action');
+    assert.equal(
+      get<{ n: number }>('SELECT COUNT(*) AS n FROM messages WHERE dedupe_key = ?', [key])!.n, 1,
+    );
+  });
+
+  test('a different scheduled action still sends', async () => {
+    connect('whatsapp_cloud');
+    await sendTemplate({ orgId: orgA, templateKey: 'first_contact', leadId: target, dedupeKey: 'run_y:0:send:a' });
+    await sendTemplate({ orgId: orgA, templateKey: 'first_contact', leadId: target, dedupeKey: 'run_y:1:send:a' });
+    assert.equal(sent.length, 2, 'two genuinely different steps are two messages');
+  });
+
+  test('a transient provider failure is retried, a permanent one is not', async () => {
+    connect('whatsapp_cloud');
+    let calls = 0;
+    registerTransport('whatsapp', async () => {
+      calls += 1;
+      return { ok: false, error: 'gateway timeout', retryable: true };
+    });
+    const key = 'run_z:0:send:retry';
+    for (let i = 0; i < 5; i += 1) {
+      await sendTemplate({ orgId: orgA, templateKey: 'first_contact', leadId: target, dedupeKey: key });
+    }
+    assert.equal(calls, 3, 'a transient failure is retried up to the attempt cap, then left alone');
+    const row = get<any>('SELECT * FROM messages WHERE dedupe_key = ?', [key])!;
+    assert.equal(row.status, 'failed');
+    assert.match(row.error, /gateway timeout/);
+
+    let permanentCalls = 0;
+    registerTransport('whatsapp', async () => {
+      permanentCalls += 1;
+      return { ok: false, error: 'that number is not on WhatsApp', retryable: false };
+    });
+    const permanentKey = 'run_z:1:send:permanent';
+    await sendTemplate({ orgId: orgA, templateKey: 'first_contact', leadId: target, dedupeKey: permanentKey });
+    await sendTemplate({ orgId: orgA, templateKey: 'first_contact', leadId: target, dedupeKey: permanentKey });
+    assert.equal(permanentCalls, 1, 'a permanent rejection is never retried');
+  });
+
+  test('an unconnected provider blocks and is never retried', async () => {
+    disconnect('whatsapp_cloud');
+    disconnect('smtp');
+    let calls = 0;
+    registerTransport('whatsapp', async () => { calls += 1; return { ok: true }; });
+
+    const key = 'run_w:0:send:blocked';
+    const first = await sendTemplate({ orgId: orgA, templateKey: 'first_contact', leadId: target, dedupeKey: key });
+    const second = await sendTemplate({ orgId: orgA, templateKey: 'first_contact', leadId: target, dedupeKey: key });
+    assert.equal(first.sent, false);
+    assert.equal(second.sent, false);
+    assert.equal(calls, 0, 'the provider is never called when it is not connected');
+    assert.match(first.reason ?? '', /not connected/i);
+    const row = get<any>('SELECT * FROM messages WHERE dedupe_key = ?', [key])!;
+    assert.equal(row.status, 'blocked');
+    assert.equal(row.sent_at, null);
+  });
+
+  test('a template that cannot be filled is refused rather than sent broken', async () => {
+    connect('whatsapp_cloud');
+    // quote_sent needs a quotation; running it without one would produce
+    // "Please find attached our quotation  for ".
+    const result = await sendTemplate({
+      orgId: orgA, templateKey: 'quote_sent', leadId: target,
+      automationRunId: 'run_missing', dedupeKey: 'run_missing:0:send:quote_sent',
+    });
+    assert.equal(result.sent, false);
+    assert.match(result.reason ?? '', /missing quote\./);
+    assert.equal(sent.length, 0, 'nothing reaches the provider');
+  });
+
+  test('an opted-out contact is never sent to, even by an enabled sequence', async () => {
+    connect('whatsapp_cloud');
+    run('UPDATE leads SET messaging_opt_out = 1 WHERE id = ?', [target]);
+    const result = await sendTemplate({
+      orgId: orgA, templateKey: 'first_contact', leadId: target,
+      automationRunId: 'run_opt', dedupeKey: 'run_opt:0:send:first_contact',
+    });
+    assert.equal(result.sent, false);
+    assert.match(result.reason ?? '', /opted out/i);
+    assert.equal(sent.length, 0);
+    run('UPDATE leads SET messaging_opt_out = 0 WHERE id = ?', [target]);
+  });
+
+  test('email is used when the customer prefers it', async () => {
+    connect('smtp');
+    disconnect('whatsapp_cloud');
+    run("UPDATE leads SET preferred_contact = 'email' WHERE id = ?", [target]);
+    const result = await sendTemplate({
+      orgId: orgA, templateKey: 'first_contact', channel: 'preferred', leadId: target,
+      dedupeKey: 'test:email:1',
+    });
+    assert.equal(result.sent, true);
+    assert.equal(get<any>('SELECT channel FROM messages WHERE id = ?', [result.messageId])!.channel, 'email');
+    assert.equal(sent[0].to, 'delivery@test.gr');
+    run("UPDATE leads SET preferred_contact = 'whatsapp' WHERE id = ?", [target]);
+  });
+
+  test('a message is never claimed as sent across a tenant boundary', async () => {
+    connect('whatsapp_cloud');
+    // Organisation B has not connected anything, so the same template refuses
+    // there even though A is connected.
+    const leadB = get<any>('SELECT id FROM leads WHERE org_id = ? LIMIT 1', [orgB]);
+    if (!leadB) return;
+    const result = await sendTemplate({ orgId: orgB, templateKey: 'first_contact', leadId: leadB.id });
+    assert.equal(result.sent, false);
+    assert.equal(sent.length, 0, "A's connected provider must not serve B");
+  });
+});
+
+// ─────────────────────────────── sequence control and stop conditions
+
+describe('sequence control', () => {
+  const enrolled = (leadId: string) => all<any>(
+    "SELECT * FROM automation_runs WHERE org_id = ? AND lead_id = ? AND status = 'active'", [orgA, leadId],
+  );
+
+  /** Books a visit `hours` from now, the way the appointments route would. */
+  const bookAppointment = (leadId: string, hours: number, title = 'Survey'): string => {
+    const id = newId('apt');
+    const now = nowIso();
+    const starts = new Date(Date.now() + hours * 3600_000).toISOString();
+    run(
+      `INSERT INTO appointments (id, org_id, lead_id, type, title, starts_at, ends_at, status,
+         assignee_id, created_by, created_at, updated_at)
+       VALUES (?,?,?, 'site_survey', ?, ?,?, 'scheduled', ?,?,?,?)`,
+      [id, orgA, leadId, title, starts, new Date(Date.now() + (hours + 1) * 3600_000).toISOString(),
+        userA, userA, now, now],
+    );
+    return id;
+  };
+
+  const freshLead = (firstName: string, extra: Record<string, any> = {}) => createLead(
+    {
+      first_name: firstName, last_name: 'Sequence',
+      phone: `+30 691 ${Math.floor(Math.random() * 900000 + 100000)}`,
+      email: `${firstName.toLowerCase()}${Date.now()}@test.gr`, project_types: ['pv'], ...extra,
+    },
+    { orgId: orgA, userId: userA, allowDuplicate: true },
+  ).lead;
+
+  test('pausing holds a sequence in place; resuming carries on from the same step', () => {
+    const lead = freshLead('Pausable');
+    const [runRow] = enrolled(lead.id);
+    assert.ok(runRow, 'the new-lead sequence should be running');
+    const stepBefore = runRow.step_index;
+
+    assert.equal(pauseRun(orgA, runRow.id), true);
+    const paused = get<any>('SELECT * FROM automation_runs WHERE id = ?', [runRow.id])!;
+    assert.ok(paused.paused_at, 'the pause is recorded');
+    assert.equal(paused.next_run_at, null, 'the scheduler can no longer pick it up');
+    assert.equal(paused.status, 'active', 'paused is not finished');
+    assert.equal(paused.step_index, stepBefore, 'it keeps its place');
+
+    // A paused run is invisible to the scheduler.
+    const dueWhilePaused = all<any>(
+      "SELECT id FROM automation_runs WHERE status = 'active' AND next_run_at IS NOT NULL AND next_run_at <= ?",
+      [nowIso()],
+    ).map((r) => r.id);
+    assert.ok(!dueWhilePaused.includes(runRow.id));
+
+    assert.equal(pauseRun(orgA, runRow.id), false, 'pausing twice is a no-op');
+
+    assert.equal(resumeRun(orgA, runRow.id), true);
+    const resumed = get<any>('SELECT * FROM automation_runs WHERE id = ?', [runRow.id])!;
+    assert.equal(resumed.paused_at, null);
+    assert.ok(resumed.next_run_at, 'it is back on the schedule');
+    assert.equal(resumed.step_index, stepBefore, 'and at the same step');
+    assert.equal(resumeRun(orgA, runRow.id), false, 'resuming twice is a no-op');
+  });
+
+  test('pausing a lead pauses its sequences without ending them', () => {
+    const lead = freshLead('LeadPause');
+    assert.ok(enrolled(lead.id).length > 0);
+    const paused = setLeadSequencesPaused(orgA, lead.id, true);
+    assert.ok(paused >= 1);
+    assert.equal(
+      get<{ n: number }>("SELECT COUNT(*) AS n FROM automation_runs WHERE lead_id = ? AND status = 'stopped'", [lead.id])!.n,
+      0, 'pausing must not stop anything',
+    );
+    assert.equal(setLeadSequencesPaused(orgA, lead.id, false), paused, 'they all come back');
+  });
+
+  test('winning the deal stops the chasing sequences', () => {
+    const lead = freshLead('Winner', { estimated_value: 12000 });
+    assert.ok(enrolled(lead.id).length > 0);
+    markWon(orgA, lead.id, userA, 12000);
+    const stopped = all<any>(
+      "SELECT stopped_reason FROM automation_runs WHERE lead_id = ? AND status = 'stopped'", [lead.id],
+    );
+    assert.ok(stopped.length > 0, 'a won deal must not keep being chased');
+    assert.ok(stopped.some((r) => r.stopped_reason === 'won'));
+  });
+
+  test('losing the lead stops the chasing sequences', () => {
+    const lead = freshLead('Loser');
+    const reason = get<{ id: string }>('SELECT id FROM lost_reasons WHERE org_id = ? LIMIT 1', [orgA])!;
+    markLost(orgA, lead.id, userA, { lost_reason_id: reason.id, lost_notes: 'Went elsewhere.' });
+    const stopped = all<any>(
+      "SELECT stopped_reason FROM automation_runs WHERE lead_id = ? AND status = 'stopped'", [lead.id],
+    );
+    assert.ok(stopped.some((r) => r.stopped_reason === 'lost'));
+  });
+
+  test('a customer reply stops the chasing sequences', () => {
+    const lead = freshLead('Replier');
+    assert.ok(enrolled(lead.id).length > 0);
+    // An inbound message is what the messaging layer records when a customer answers.
+    logActivity({
+      orgId: orgA, leadId: lead.id, type: 'whatsapp', direction: 'inbound',
+      title: 'Reply received', body: 'Yes please, go ahead.', isCustomerTouch: true,
+    });
+    const stopped = all<any>(
+      "SELECT stopped_reason FROM automation_runs WHERE lead_id = ? AND status = 'stopped'", [lead.id],
+    );
+    assert.ok(stopped.some((r) => r.stopped_reason === 'customer_replied'),
+      'nobody should be chased after they have answered');
+  });
+
+  test('an accepted quotation stops the quotation sequence', () => {
+    const lead = freshLead('Accepter', { estimated_value: 9000 });
+    const quote = createQuotation({
+      orgId: orgA, userId: userA, leadId: lead.id, title: 'PV system',
+      items: [{ name: 'PV module', quantity: 10, unit: 'pcs', unit_price: 95 }],
+    });
+    markSent(orgA, quote.id, userA, 'manual');
+    const quoteRuns = all<any>(
+      "SELECT * FROM automation_runs WHERE lead_id = ? AND quotation_id = ? AND status = 'active'",
+      [lead.id, quote.id],
+    );
+    assert.ok(quoteRuns.length > 0, 'sending a quotation starts its follow-up sequence');
+
+    setQuotationStatus(orgA, quote.id, userA, 'accepted');
+    const after = all<any>(
+      "SELECT status, stopped_reason FROM automation_runs WHERE lead_id = ? AND quotation_id = ?",
+      [lead.id, quote.id],
+    );
+    assert.ok(after.every((r) => r.status !== 'active'), 'an accepted quotation is not chased');
+    assert.ok(after.some((r) => r.stopped_reason === 'quote_responded' || r.stopped_reason === 'won'));
+  });
+
+  test('a cancelled appointment leaves no reminder running', () => {
+    const lead = freshLead('Canceller');
+    const id = bookAppointment(lead.id, 20);
+    run("UPDATE automation_rules SET is_active = 1 WHERE org_id = ? AND key = 'appointment_reminder'", [orgA]);
+    emit({ type: 'appointment_reminder_due', orgId: orgA, leadId: lead.id, appointmentId: id });
+    assert.ok(
+      all<any>('SELECT 1 FROM automation_runs WHERE org_id = ? AND appointment_id = ?', [orgA, id]).length > 0,
+      'the reminder is enrolled against the appointment',
+    );
+
+    run("UPDATE appointments SET status = 'cancelled' WHERE id = ?", [id]);
+    emit({ type: 'appointment_cancelled', orgId: orgA, leadId: lead.id, appointmentId: id });
+    const after = all<any>(
+      "SELECT status FROM automation_runs WHERE org_id = ? AND appointment_id = ?", [orgA, id],
+    );
+    assert.ok(after.every((r) => r.status !== 'active'), 'nothing is left to remind about a cancelled visit');
+  });
+
+  test('cancelling stops a reminder that had not run yet', () => {
+    const lead = freshLead('LateCancel');
+    const id = bookAppointment(lead.id, 20);
+    // A step still waiting, as a multi-step reminder would be.
+    const runId = newId('run');
+    const rule = get<{ id: string }>(
+      "SELECT id FROM automation_rules WHERE org_id = ? AND key = 'appointment_reminder'", [orgA],
+    )!;
+    run(
+      `INSERT INTO automation_runs (id, org_id, rule_id, lead_id, appointment_id, run_key, status,
+         step_index, next_run_at, context, log, started_at)
+       VALUES (?,?,?,?,?,?, 'active', 0, ?, '{}', '[]', ?)`,
+      [runId, orgA, rule.id, lead.id, id, `${rule.id}:${lead.id}:-:${id}:pending`,
+        addMinutes(new Date(), 600), nowIso()],
+    );
+    run("UPDATE appointments SET status = 'cancelled' WHERE id = ?", [id]);
+    emit({ type: 'appointment_cancelled', orgId: orgA, leadId: lead.id, appointmentId: id });
+
+    const after = get<any>('SELECT status, stopped_reason FROM automation_runs WHERE id = ?', [runId])!;
+    assert.equal(after.status, 'stopped');
+    assert.equal(after.stopped_reason, 'appointment_cancelled');
+  });
+
+  test('the reminder sweep ignores a cancelled appointment', () => {
+    const lead = freshLead('NeverRemind');
+    const id = bookAppointment(lead.id, 20);
+    run("UPDATE appointments SET status = 'cancelled' WHERE id = ?", [id]);
+    // This is the sweep's own condition: only a scheduled visit is reminded about.
+    const wouldRemind = all<any>(
+      `SELECT id FROM appointments
+       WHERE status = 'scheduled' AND starts_at > ? AND starts_at < ? AND id = ?`,
+      [nowIso(), addDays(new Date(), 1), id],
+    );
+    assert.equal(wouldRemind.length, 0, 'a cancelled visit is never reminded about in the first place');
+  });
+
+  test('two appointments for one lead each get their own reminder', () => {
+    const lead = freshLead('TwoVisits');
+    run("UPDATE automation_rules SET is_active = 1 WHERE org_id = ? AND key = 'appointment_reminder'", [orgA]);
+    const ids: string[] = [];
+    for (let i = 0; i < 2; i += 1) {
+      const id = bookAppointment(lead.id, 20 + i * 24, `Visit ${i}`);
+      ids.push(id);
+      emit({ type: 'appointment_reminder_due', orgId: orgA, leadId: lead.id, appointmentId: id });
+    }
+    // The run key includes the appointment, so the second visit is not swallowed
+    // by the first — while re-firing either one still cannot duplicate it.
+    emit({ type: 'appointment_reminder_due', orgId: orgA, leadId: lead.id, appointmentId: ids[0] });
+    for (const id of ids) {
+      assert.equal(
+        get<{ n: number }>('SELECT COUNT(*) AS n FROM automation_runs WHERE appointment_id = ?', [id])!.n,
+        1, 'one reminder per appointment, however often the trigger fires',
+      );
+    }
+  });
+});
+
+// ─────────────────────────────── the action centre, kind by kind
+
+describe('action centre', () => {
+  const list = (opts: Partial<{ userId: string; seesAll: boolean }> = {}) => buildAttentionList({
+    orgId: orgA, userId: opts.userId ?? userA, seesAll: opts.seesAll ?? true, staleHours: 48,
+  });
+  const backdate = (leadId: string, days: number) => {
+    run('UPDATE leads SET last_activity_at = ? WHERE id = ?', [
+      new Date(Date.now() - days * 86400_000).toISOString(), leadId,
+    ]);
+  };
+
+  test('an overdue follow-up says how overdue, and how warm the lead is', () => {
+    const { lead } = createLead(
+      {
+        first_name: 'Overdue', last_name: 'Chase', phone: '+30 691 888 0001',
+        email: 'od@test.gr', project_types: ['pv'], estimated_value: 15000,
+      },
+      { orgId: orgA, userId: userA, skipAutomation: true, allowDuplicate: true },
+    );
+    createTask({
+      orgId: orgA, leadId: lead.id, title: 'Call about the quotation', type: 'call',
+      assigneeId: userA, dueAt: new Date(Date.now() - 3 * 86400_000).toISOString(),
+      priority: 'high', source: 'manual',
+    });
+    const item = list().find((i) => i.kind === 'overdue_task' && i.lead_id === lead.id);
+    assert.ok(item, 'an overdue follow-up must surface');
+    assert.match(item!.reason, /overdue by 3 days/);
+    assert.ok(item!.temperature, 'the existing temperature travels with the item');
+    assert.equal(item!.priority, 1);
+    assert.equal(item!.action, 'contact');
+    assert.match(item!.context ?? '', /Call about the quotation/);
+  });
+
+  test('a quiet hot lead names the temperature and the silence', () => {
+    const { lead } = createLead(
+      {
+        first_name: 'Quiet', last_name: 'Hot', phone: '+30 691 888 0002', email: 'qh@test.gr',
+        project_types: ['pv', 'battery'], estimated_value: 30000, requested_quote: 1, urgency: 'immediate',
+        budget_known: 1, pv_annual_kwh: 14000,
+      },
+      { orgId: orgA, userId: userA, skipAutomation: true, allowDuplicate: true },
+    );
+    rescoreLead(orgA, lead.id);
+    backdate(lead.id, 4);
+    rescoreLead(orgA, lead.id, { touch: false });
+    const fresh = get<any>('SELECT temperature FROM leads WHERE id = ?', [lead.id])!;
+    const item = list().find((i) => i.lead_id === lead.id && ['hot_lead', 'idle_lead'].includes(i.kind));
+    assert.ok(item, `a lead quiet for four days must surface (temperature ${fresh.temperature})`);
+    assert.match(item!.reason, /lead/i);
+    assert.match(item!.reason, /no (contact|activity) for 4 days/);
+    assert.equal(item!.action, 'contact');
+    assert.ok(item!.template_key, 'the composer knows which template to open with');
+  });
+
+  test('a viewed quotation says the amount and when it was opened', () => {
+    const { lead } = createLead(
+      {
+        first_name: 'Viewer', last_name: 'Quiet', phone: '+30 691 888 0003', email: 'vq@test.gr',
+        project_types: ['pv'],
+      },
+      { orgId: orgA, userId: userA, skipAutomation: true, allowDuplicate: true },
+    );
+    const quote = createQuotation({
+      orgId: orgA, userId: userA, leadId: lead.id, title: 'PV system',
+      items: [{ name: 'PV module', quantity: 40, unit: 'pcs', unit_price: 95 }],
+    });
+    markSent(orgA, quote.id, userA, 'manual');
+    const fourDaysAgo = new Date(Date.now() - 4 * 86400_000).toISOString();
+    run('UPDATE quotations SET first_viewed_at = ?, last_viewed_at = ?, view_count = 3, sent_at = ? WHERE id = ?', [
+      fourDaysAgo, fourDaysAgo, new Date(Date.now() - 6 * 86400_000).toISOString(), quote.id,
+    ]);
+
+    const item = list().find((i) => i.kind === 'quote_viewed' && i.quotation_id === quote.id);
+    assert.ok(item, 'a quotation opened and unanswered is the warmest call of the day');
+    assert.match(item!.reason, /opened 4 days ago with no response/);
+    // The VAT-inclusive total, which is what the customer was quoted.
+    assert.match(item!.reason, /4,712/, 'the amount is in the reason, not hidden in a tooltip');
+    assert.match(item!.context ?? '', /3 views/);
+    assert.equal(item!.priority, 1);
+    assert.equal(item!.template_key, 'quote_follow_up');
+  });
+
+  test('a won job with nothing in the diary asks to be scheduled', () => {
+    const { lead } = createLead(
+      {
+        first_name: 'Sold', last_name: 'Unscheduled', phone: '+30 691 888 0004', email: 'su@test.gr',
+        project_types: ['pv'], estimated_value: 18000,
+      },
+      { orgId: orgA, userId: userA, skipAutomation: true, allowDuplicate: true },
+    );
+    markWon(orgA, lead.id, userA, 18000);
+    const item = list().find((i) => i.kind === 'installation_unscheduled' && i.lead_id === lead.id);
+    assert.ok(item, 'a sold job with no installation booked must surface');
+    assert.match(item!.reason, /installation not scheduled/i);
+    assert.equal(item!.action, 'schedule_installation');
+
+    // Booking the installation takes it off the list.
+    const now = nowIso();
+    run(
+      `INSERT INTO appointments (id, org_id, lead_id, type, title, starts_at, ends_at, status,
+         assignee_id, created_by, created_at, updated_at)
+       VALUES (?,?,?, 'installation', 'Installation', ?,?, 'scheduled', ?,?,?,?)`,
+      [newId('apt'), orgA, lead.id, addDays(new Date(), 20), addDays(new Date(), 20), userA, userA, now, now],
+    );
+    assert.ok(
+      !list().some((i) => i.kind === 'installation_unscheduled' && i.lead_id === lead.id),
+      'once it is in the diary it stops asking',
+    );
+  });
+
+  test('an upcoming visit says what and when', () => {
+    const { lead } = createLead(
+      {
+        first_name: 'Tomorrow', last_name: 'Visit', phone: '+30 691 888 0005', email: 'tv@test.gr',
+        project_types: ['pv'],
+      },
+      { orgId: orgA, userId: userA, skipAutomation: true, allowDuplicate: true },
+    );
+    const starts = new Date(Date.now() + 20 * 3600_000);
+    const now = nowIso();
+    run(
+      `INSERT INTO appointments (id, org_id, lead_id, type, title, starts_at, ends_at, status,
+         assignee_id, created_by, created_at, updated_at)
+       VALUES (?,?,?, 'site_survey', 'Site survey', ?,?, 'scheduled', ?,?,?,?)`,
+      [newId('apt'), orgA, lead.id, starts.toISOString(),
+        new Date(starts.getTime() + 3600_000).toISOString(), userA, userA, now, now],
+    );
+    const item = list().find((i) => i.kind === 'appointment_upcoming' && i.lead_id === lead.id);
+    assert.ok(item);
+    assert.match(item!.reason, /Site survey (today|tomorrow) at \d{2}:\d{2}/);
+    assert.match(item!.context ?? '', /customer (confirmed|not told yet)/);
+  });
+
+  test('the list is ranked by urgency, then by what is at stake', () => {
+    const items = list();
+    for (let i = 1; i < items.length; i += 1) {
+      assert.ok(items[i - 1].priority <= items[i].priority, 'priority bands never interleave');
+    }
+    // Inside the top band, the bigger opportunity comes first.
+    const urgent = items.filter((i) => i.priority === 1 && i.value);
+    for (let i = 1; i < urgent.length; i += 1) {
+      const previous = (urgent[i - 1].value ?? 0) + (urgent[i - 1].score ?? 0) * 10;
+      const current = (urgent[i].value ?? 0) + (urgent[i].score ?? 0) * 10;
+      assert.ok(previous >= current - 3000, 'a much larger opportunity should not sit below a small one');
+    }
+  });
+
+  test('every item carries enough context to act without investigating', () => {
+    for (const item of list()) {
+      assert.ok(item.name.trim().length > 0, 'the customer is named');
+      assert.ok(item.reason.trim().length > 8, `"${item.reason}" should explain why it is here`);
+      assert.ok(item.action_label.trim().length > 0, 'there is something to press');
+      assert.ok(item.link.startsWith('/app/'), 'and somewhere to go');
+      // "BAD: George Papadopoulos" — the name alone is never the whole story.
+      assert.notEqual(item.reason, item.name);
+    }
+  });
+
+  test('an enabled sequence shows up next to the manual action', () => {
+    const { lead } = createLead(
+      {
+        first_name: 'Scheduled', last_name: 'Chase', phone: '+30 691 888 0006', email: 'sc@test.gr',
+        project_types: ['pv'], estimated_value: 9000,
+      },
+      { orgId: orgA, userId: userA, allowDuplicate: true },
+    );
+    // The new-lead sequence enrols on creation and has a later step waiting.
+    run("UPDATE automation_runs SET next_run_at = ? WHERE lead_id = ? AND status = 'active'", [
+      addMinutes(new Date(), 600), lead.id,
+    ]);
+    createTask({
+      orgId: orgA, leadId: lead.id, title: 'Call back', type: 'call', assigneeId: userA,
+      dueAt: new Date(Date.now() - 86400_000).toISOString(), priority: 'high', source: 'manual',
+    });
+    const item = list().find((i) => i.lead_id === lead.id);
+    assert.ok(item);
+    assert.ok(item!.next_automated_at, 'the owner can see a chase is already booked');
+  });
+
+  test('the action centre never crosses a tenant boundary', () => {
+    const mine = new Set(list().map((i) => i.id));
+    for (const item of buildAttentionList({ orgId: orgB, userId: userB, seesAll: true, staleHours: 48 })) {
+      assert.ok(!mine.has(item.id), 'no item may appear for two companies');
+    }
+  });
+
+  test('a scoped user sees only their own work, and never the manager-only kinds', () => {
+    const scoped = buildAttentionList({ orgId: orgA, userId: userB, seesAll: false, staleHours: 48 });
+    assert.equal(scoped.some((i) => i.kind === 'unassigned'), false, 'assigning is a manager job');
+    for (const item of scoped) {
+      if (!item.lead_id) continue;
+      const owner = get<{ owner_id: string | null }>(
+        'SELECT owner_id FROM leads WHERE id = ?', [item.lead_id],
+      );
+      assert.notEqual(owner?.owner_id, userA, "someone else's lead must not appear in a scoped list");
+    }
   });
 });

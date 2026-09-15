@@ -294,7 +294,7 @@ publicRouter.get('/quote/:token', rateLimit({ name: 'quote_view', windowMs: 60_0
   if (!quote.first_viewed_at) {
     setQuotationStatus(row.org_id, row.id, null, 'viewed');
   }
-  run('UPDATE quotations SET view_count = view_count + 1 WHERE id = ?', [row.id]);
+  run('UPDATE quotations SET view_count = view_count + 1, last_viewed_at = ? WHERE id = ?', [nowIso(), row.id]);
 
   const expired = row.valid_until ? new Date(row.valid_until) < new Date() : false;
   res.json({

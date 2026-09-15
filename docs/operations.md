@@ -82,6 +82,11 @@ SMTP is **verified against your server** before it is stored as connected: a
 wrong password fails at the moment you save it, not silently at 2 a.m. when a
 follow-up was supposed to go out.
 
+Each channel's transport is registered rather than hard-wired, so a provider can
+be substituted at that boundary — which is how the delivery tests exercise a
+connected provider, a transient failure and a permanent rejection without any
+real credentials.
+
 Automation follows the same rule. A `send_template` step that cannot send writes
 the reason into the rule's run log, so "the automation is on" and "the message
 went out" are never confused with each other.
@@ -142,7 +147,7 @@ disk; there is no queue, no cache and no second database to operate.
 ## Tests
 
 ```bash
-npm test          # 67 domain tests
+npm test          # 96 domain tests
 npm run typecheck # server and client
 npm run build     # production build of both
 ```

@@ -24,7 +24,9 @@ The dashboard opens on **what needs you now**: one ranked list of overdue
 follow-ups, hot leads going quiet, surveys waiting for a quotation, quotations
 the customer opened but never answered, visits nobody closed off, and sold jobs
 with no installation date — each with the customer's name, the reason, the money
-at stake, and the button that does the thing.
+at stake, and the button that does the thing. Pressing it opens the composer,
+the quotation builder or the booking dialog right there, with the right template
+already loaded. Business performance sits below the work, not above it.
 
 ---
 
@@ -125,10 +127,15 @@ they message real customers. Turn them on once a channel is connected and you ar
 happy with the wording.
 
 Sequences stop automatically when the customer replies, an appointment is booked,
-the deal is won or lost, the contact opts out, or a salesperson pauses automation
-on that lead. Each lead shows its running sequences with the next scheduled step,
-everything already done, anything that failed, and a Stop button. A visual builder
-lets you add your own rules without programming.
+the quotation is answered, the deal is won or lost, or the contact opts out. Each
+lead shows its running sequences with the next scheduled step, everything already
+done, anything that failed, and Pause / Resume / Stop — pausing holds a sequence
+where it is and resuming gives back the delay it had left. A visual builder lets
+you add your own rules without programming.
+
+A customer is never messaged twice for the same scheduled action: every send
+claims its own identity before the provider is called, so a retry, a duplicated
+tick or a restart replays the original outcome instead of sending again.
 
 ### Quote
 - **Straight from the survey.** A completed site survey offers **Create
@@ -177,7 +184,7 @@ server/                 Node 22 + Express + SQLite (node:sqlite, no native deps)
                         messaging, billing, auth, permissions, audit
   src/routes/           the HTTP surface, one router per area
   src/jobs/scheduler.ts the tick that drives automation and overdue alerts
-  test/                 67 domain tests (node:test)
+  test/                 96 domain tests (node:test)
 web/                    React 19 + Vite + TanStack Query
   src/pages/            one file per screen
   src/components/       shared UI, lead form, quotation builder
@@ -255,7 +262,7 @@ starts with the full Growth feature set plus AI.
 ## Tests
 
 ```bash
-npm test          # 67 domain tests: scoring, quotations, automation, tenancy, limits
+npm test          # 96 domain tests: scoring, quotations, automation, tenancy, limits
 npm run typecheck # server and client
 npm run build     # production build of both
 ```

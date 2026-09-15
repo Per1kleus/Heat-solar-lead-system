@@ -12,6 +12,43 @@ export function render(template: string, ctx: Record<string, any>): string {
   });
 }
 
+/**
+ * Placeholders whose absence makes a message obviously broken — "Hello , your
+ * quotation  totals ". Decoration like a location or a website may be empty; a
+ * name or an amount may not. An automated send that hits one of these refuses
+ * rather than posting nonsense to a customer.
+ */
+const ESSENTIAL_PLACEHOLDERS = new Set([
+  'lead.first_name', 'lead.full_name', 'lead.project_summary',
+  'quote.number', 'quote.total', 'quote.valid_until',
+  'appointment.date', 'appointment.title',
+  'company.name',
+]);
+
+export interface RenderCheck {
+  text: string;
+  /** Essential placeholders the context could not fill, e.g. ["quote.number"]. */
+  missing: string[];
+}
+
+/**
+ * Renders and reports what could not be filled. Used before an automated send so
+ * a template referring to something this lead does not have is refused with a
+ * reason, instead of going out with holes in it.
+ */
+export function renderChecked(template: string, ctx: Record<string, any>): RenderCheck {
+  const missing: string[] = [];
+  if (!template) return { text: '', missing };
+  const text = template.replace(/\{\{\s*([a-z_]+)\.([a-z_]+)\s*\}\}/gi, (_m, scope: string, key: string) => {
+    const path = `${scope.toLowerCase()}.${key.toLowerCase()}`;
+    const value = resolvePlaceholder(scope.toLowerCase(), key.toLowerCase(), ctx);
+    const empty = value === null || value === undefined || String(value).trim() === '';
+    if (empty && ESSENTIAL_PLACEHOLDERS.has(path) && !missing.includes(path)) missing.push(path);
+    return empty ? '' : String(value);
+  });
+  return { text, missing };
+}
+
 function resolvePlaceholder(scope: string, key: string, ctx: any): unknown {
   const lead = ctx.lead;
   const quote = ctx.quotation ?? ctx.quote;

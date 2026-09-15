@@ -316,10 +316,19 @@ another request:
 
 Kinds: `overdue_task`, `appointment_missed`, `hot_lead`, `survey_to_quote`,
 `quote_viewed`, `quote_awaiting`, `appointment_upcoming`, `no_next_action`,
-`unassigned`, `idle_lead`, `installation_due`, `recovery_due`. Priority 1 is
-today's work; the list is sorted by priority then by the money at stake. It is
-built from the existing score, stage, next-action date, quotation status, survey
-status and appointment status — there is no second scoring system.
+`unassigned`, `idle_lead`, `installation_unscheduled`, `installation_due`,
+`recovery_due`.
+
+Priority 1 is today's work; within a band the list is ordered by the money at
+stake, with the lead's own temperature and score breaking ties. Every input —
+score, temperature, stage, next-action date, quotation status, survey status,
+appointment status — comes from what the CRM already keeps. There is no second
+scoring system.
+
+Each item also carries what the UI needs to act without another request:
+`template_key` (which template the composer should open with), `temperature` and
+`score`, and `next_automated_at` when an enabled sequence already has a message
+scheduled for that lead — so the owner can see a chase is booked and skip it.
 
 ### Automations
 
@@ -427,8 +436,15 @@ sending, which keeps template logic and company data on the server.
 ```http
 POST /api/leads/:id/messaging-opt-out    { opted_out: true | false }
 POST /api/leads/:id/automation           { paused: true | false }
+POST /api/leads/:id/automation/:runId/pause
+POST /api/leads/:id/automation/:runId/resume
 POST /api/leads/:id/automation/:runId/stop
 ```
+
+Pausing holds a sequence at its current step and takes it off the schedule;
+resuming gives back the delay that was left rather than firing everything that
+came due meanwhile. Stopping ends it with the reason recorded. All three are
+audited.
 
 `messaging-opt-out` is "do not contact me automatically". It blocks every
 automated send for that contact, stops whatever sequences are running (returning

@@ -15,7 +15,7 @@ import { newId } from '../lib/ids.ts';
 import { assertLeadAllowance } from '../lib/billing.ts';
 import { readIdempotent, writeIdempotent } from '../lib/idempotency.ts';
 import { emit } from '../lib/events.ts';
-import { stopAllRuns, stopRun } from '../lib/automation.ts';
+import { pauseRun, resumeRun, setLeadSequencesPaused, stopAllRuns, stopRun } from '../lib/automation.ts';
 
 export const leadsRouter = Router();
 
@@ -220,8 +220,8 @@ leadsRouter.get('/:id', requirePermission('leads:read:own', 'leads:read:all'), a
       [req.ctx.orgId, lead.id],
     ) ?? null,
     automation_runs: all(
-      `SELECT r.id, r.rule_id, r.status, r.step_index, r.next_run_at, r.stopped_reason, r.started_at, r.log,
-              ar.name AS rule_name, ar.trigger_type
+      `SELECT r.id, r.rule_id, r.status, r.step_index, r.next_run_at, r.stopped_reason, r.started_at,
+              r.paused_at, r.log, ar.name AS rule_name, ar.trigger_type
        FROM automation_runs r JOIN automation_rules ar ON ar.id = r.rule_id
        WHERE r.org_id = ? AND r.lead_id = ? ORDER BY r.started_at DESC`,
       [req.ctx.orgId, lead.id],
@@ -370,17 +370,47 @@ leadsRouter.post('/:id/automation', requirePermission('leads:write'), ah((req, r
   run('UPDATE leads SET automation_paused = ?, updated_at = ? WHERE id = ? AND org_id = ?', [
     paused ? 1 : 0, nowIso(), lead.id, req.ctx.orgId,
   ]);
-  if (paused) {
-    run("UPDATE automation_runs SET status = 'stopped', stopped_reason = 'paused', next_run_at = NULL WHERE org_id = ? AND lead_id = ? AND status = 'active'", [
-      req.ctx.orgId, lead.id,
-    ]);
-  }
+  // Pausing holds the sequences where they are rather than ending them, so
+  // resuming picks up the same step with the delay it had left.
+  const changed = setLeadSequencesPaused(req.ctx.orgId, lead.id, paused);
   logActivity({
     orgId: req.ctx.orgId, leadId: lead.id, type: 'automation',
     title: paused ? 'Automation paused for this lead' : 'Automation resumed for this lead',
+    body: changed > 0 ? `${changed} sequence(s) ${paused ? 'paused' : 'resumed'}.` : null,
     userId: req.ctx.user.id,
   });
-  res.json({ lead: shapeLead(loadLead(req.ctx.orgId, lead.id)) });
+  res.json({ lead: shapeLead(loadLead(req.ctx.orgId, lead.id)), changed });
+}));
+
+/** Pause, resume or stop one sequence on this lead, leaving the others alone. */
+leadsRouter.post('/:id/automation/:runId/:command', requirePermission('leads:write'), ah((req, res) => {
+  const command = z.enum(['pause', 'resume', 'stop']).parse(req.params.command);
+  const lead = loadLead(req.ctx.orgId, req.params.id);
+  assertVisible(req, lead);
+  const runRow = get<{ id: string; lead_id: string }>(
+    'SELECT id, lead_id FROM automation_runs WHERE id = ? AND org_id = ?', [req.params.runId, req.ctx.orgId],
+  );
+  if (!runRow || runRow.lead_id !== lead.id) throw notFound('That sequence no longer exists.');
+
+  const applied = command === 'pause'
+    ? pauseRun(req.ctx.orgId, runRow.id)
+    : command === 'resume'
+      ? resumeRun(req.ctx.orgId, runRow.id)
+      : stopRun(req.ctx.orgId, runRow.id, 'stopped_manually');
+
+  if (applied) {
+    logActivity({
+      orgId: req.ctx.orgId, leadId: lead.id, type: 'automation',
+      title: `Follow-up sequence ${command === 'stop' ? 'stopped' : `${command}d`} by hand`,
+      userId: req.ctx.user.id,
+    });
+    audit({
+      orgId: req.ctx.orgId, userId: req.ctx.user.id, action: `automation.run_${command}`,
+      entityType: 'automation_run', entityId: runRow.id,
+      entityLabel: `${lead.first_name} ${lead.last_name}`,
+    });
+  }
+  res.json({ applied, stopped: command === 'stop' ? applied : undefined });
 }));
 
 /**
@@ -410,24 +440,6 @@ leadsRouter.post('/:id/messaging-opt-out', requirePermission('leads:write'), ah(
     entityType: 'lead', entityId: lead.id, entityLabel: `${lead.first_name} ${lead.last_name}`,
   });
   res.json({ lead: shapeLead(loadLead(req.ctx.orgId, lead.id)), stopped });
-}));
-
-/** Stops one running sequence on this lead, leaving the others alone. */
-leadsRouter.post('/:id/automation/:runId/stop', requirePermission('leads:write'), ah((req, res) => {
-  const lead = loadLead(req.ctx.orgId, req.params.id);
-  assertVisible(req, lead);
-  const runRow = get<{ id: string; lead_id: string }>(
-    'SELECT id, lead_id FROM automation_runs WHERE id = ? AND org_id = ?', [req.params.runId, req.ctx.orgId],
-  );
-  if (!runRow || runRow.lead_id !== lead.id) throw notFound('That sequence no longer exists.');
-  const stopped = stopRun(req.ctx.orgId, runRow.id, 'stopped_manually');
-  if (stopped) {
-    logActivity({
-      orgId: req.ctx.orgId, leadId: lead.id, type: 'automation',
-      title: 'Follow-up sequence stopped by hand', userId: req.ctx.user.id,
-    });
-  }
-  res.json({ stopped });
 }));
 
 // --- activities -----------------------------------------------------------

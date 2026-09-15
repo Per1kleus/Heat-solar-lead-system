@@ -483,6 +483,9 @@ CREATE TABLE IF NOT EXISTS quotations (
   sent_at       TEXT,
   sent_via      TEXT,
   first_viewed_at TEXT,
+  -- When the customer last opened it. "Opened four days ago and went quiet" is
+  -- the whole reason a follow-up is worth making today.
+  last_viewed_at TEXT,
   view_count    INTEGER NOT NULL DEFAULT 0,
   responded_at  TEXT,
   accepted_at   TEXT,
@@ -616,10 +619,18 @@ CREATE TABLE IF NOT EXISTS messages (
   sent_at       TEXT,
   user_id       TEXT REFERENCES users(id) ON DELETE SET NULL,
   automation_run_id TEXT,
+  -- The identity of the scheduled action that produced this message, e.g.
+  -- "run_x:2:send:quote_follow_up". Claimed BEFORE the provider is called, so a
+  -- retry, a duplicated scheduler tick or a restart mid-send cannot produce a
+  -- second message to the customer. Never derived from the message content.
+  dedupe_key    TEXT,
+  attempts      INTEGER NOT NULL DEFAULT 0,
   created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_lead ON messages(org_id, lead_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(org_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_dedupe
+  ON messages(org_id, dedupe_key) WHERE dedupe_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS message_templates (
   id            TEXT PRIMARY KEY,
@@ -680,6 +691,10 @@ CREATE TABLE IF NOT EXISTS automation_runs (
   -- would not actually deduplicate a lead-only rule. This flattened key does:
   -- one run per rule per target, with "-" standing in for the empty parts.
   run_key       TEXT,
+  -- Set while a sequence is paused. next_run_at is cleared at the same time, so
+  -- the scheduler never picks it up; resuming shifts the remaining delay forward
+  -- by however long it was paused.
+  paused_at     TEXT,
   UNIQUE (rule_id, lead_id, quotation_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_key ON automation_runs(run_key) WHERE run_key IS NOT NULL;

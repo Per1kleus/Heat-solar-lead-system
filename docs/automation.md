@@ -148,12 +148,41 @@ A `send_template` action writes the real outcome of the send, including the
 reason it did not go out. An automation that shows as active is genuinely
 running; one that could not do something says so.
 
+## Pausing, resuming and stopping
+
+Each lead's Automation tab lists its sequences with the next scheduled step,
+everything that has already run, anything that failed, and three controls:
+
+| | What it does |
+|---|---|
+| **Pause** | holds the sequence where it is. It leaves the scheduler's reach, keeps its step, and remembers when it was paused |
+| **Resume** | puts it back with whatever delay was left — a step that had three days to go still has three days, not "overdue" |
+| **Stop** | ends it, with the reason recorded |
+
+Pausing the whole lead does the same to all of its sequences at once. None of
+this ends anything: a paused sequence is still `active`, just not scheduled.
+
 ## Guarantees worth knowing
 
-- **A lead is enrolled in a rule once.** A unique index on
-  `(rule_id, lead_id, quotation_id)` makes re-enrolment a no-op, so a lead that
-  bounces in and out of a stage does not collect duplicate task chains.
+- **A lead is enrolled in a rule once.** A flattened run key over
+  `(rule, lead, quotation, appointment)` makes re-enrolment a no-op, so a lead
+  that bounces in and out of a stage does not collect duplicate task chains —
+  while two different appointments still each get their own reminder.
 - **A retried step cannot duplicate a task.** Each step carries a dedupe key.
+- **A customer is never messaged twice for one scheduled action.** Every
+  customer-facing send claims `run:step:send:template` *before* the provider is
+  called. A duplicated tick, a worker retry or a restart mid-send lands on the
+  same claim and replays the original outcome instead of sending again. The key
+  is never derived from the message content, so a genuinely different step —
+  the day-5 chase after the day-2 one — still sends.
+- **A transient failure is retried, a permanent one is not.** A timeout or a 5xx
+  is tried up to three times; a rejected recipient, a refused login or an opt-out
+  is recorded once and left alone.
+- **A template it cannot fill is refused.** If an essential placeholder — a name,
+  a quotation number or total, an appointment date — resolves empty, the
+  automated send is refused with a note of which field is missing, rather than
+  posting "Hello , your quotation  totals " to a customer. Someone composing by
+  hand sees the same text and can fix it themselves.
 - **The scheduler is the only clock.** Steps become due; a sweep executes them.
   Nothing runs inside the HTTP request that triggered it, so a slow send can
   never slow down the person using the app.

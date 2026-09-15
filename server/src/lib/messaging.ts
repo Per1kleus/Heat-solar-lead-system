@@ -4,7 +4,7 @@ import { newId } from './ids.ts';
 import { nowIso } from './time.ts';
 import { logActivity, bumpUsage } from './leads.ts';
 import { notConfigured, badRequest } from './errors.ts';
-import { render } from './render.ts';
+import { render, renderChecked } from './render.ts';
 
 export type Channel = 'email' | 'whatsapp' | 'sms' | 'phone';
 
@@ -56,6 +56,46 @@ export interface SendMessageInput {
   userId?: string | null;
   automationRunId?: string | null;
   attachments?: { filename: string; path: string }[];
+  /**
+   * The identity of the scheduled action this send belongs to. Claimed before
+   * the provider is called, so a retry or a duplicated tick replays the original
+   * outcome instead of messaging the customer twice. Never content-derived.
+   */
+  dedupeKey?: string | null;
+}
+
+/** How many times a transient provider failure is retried before giving up. */
+const MAX_SEND_ATTEMPTS = 3;
+
+export interface ProviderResult {
+  ok: boolean;
+  providerMessageId?: string | null;
+  error?: string;
+  /** False for a permanent rejection (bad address, refused content). */
+  retryable?: boolean;
+}
+
+/**
+ * A channel's actual transport. Registered rather than hard-wired so a test can
+ * substitute a provider at this boundary without real credentials, and so a new
+ * provider is one registration rather than a change to the send path.
+ */
+export type ProviderTransport = (
+  input: SendMessageInput,
+  config: Record<string, any>,
+  secrets: Record<string, any>,
+) => Promise<ProviderResult>;
+
+const transports: Record<string, ProviderTransport> = {};
+
+export function registerTransport(channel: Channel, transport: ProviderTransport): void {
+  transports[channel] = transport;
+}
+
+/** Restores the real provider. Used by tests after substituting one. */
+export function resetTransports(): void {
+  transports.email = smtpTransport;
+  transports.whatsapp = whatsAppTransport;
 }
 
 /**
@@ -64,87 +104,196 @@ export interface SendMessageInput {
  * `blocked` message and returns `sent: false` with the reason.
  */
 export async function sendMessage(input: SendMessageInput): Promise<SendResult> {
-  const messageId = newId('msg');
-  const purpose = input.purpose ?? 'operational';
-
-  if (purpose === 'marketing') {
-    const consent = checkMarketingConsent(input.orgId, input.leadId, input.customerId);
-    if (!consent.allowed) {
-      recordMessage(input, messageId, 'blocked', null, consent.reason);
-      return { sent: false, messageId, reason: consent.reason };
-    }
-  }
-
   if (input.channel === 'phone') {
     throw badRequest('Phone calls are logged, not sent. Use the call-logging action instead.');
   }
 
-  if (input.channel === 'email') return sendEmail(input, messageId);
-  if (input.channel === 'whatsapp') return sendWhatsApp(input, messageId);
+  // Claim the send first. If this exact scheduled action already ran, its
+  // outcome is replayed rather than repeated — the customer is never messaged
+  // twice because a tick was duplicated or a worker retried.
+  const claim = claimMessage(input);
+  if (claim.replay) return claim.replay;
+  const messageId = claim.messageId;
 
-  const reason = 'SMS is not available yet. Connect an SMS provider in Settings to enable it.';
-  recordMessage(input, messageId, 'blocked', null, reason);
-  return { sent: false, messageId, reason };
+  if ((input.purpose ?? 'operational') === 'marketing') {
+    const consent = checkMarketingConsent(input.orgId, input.leadId, input.customerId);
+    if (!consent.allowed) return settle(input, messageId, 'blocked', null, consent.reason);
+  }
+
+  if (input.channel === 'sms') {
+    return settle(input, messageId, 'blocked', null,
+      'SMS is not available yet — no SMS provider is implemented in VoltaFlow.');
+  }
+
+  const provider = input.channel === 'email' ? 'smtp' : 'whatsapp_cloud';
+  const integration = getIntegration(input.orgId, provider);
+  if (!integration || integration.status !== 'connected') {
+    return settle(input, messageId, 'blocked', null, channelStatus(input.orgId)[input.channel].reason);
+  }
+
+  const transport = transports[input.channel];
+  if (!transport) {
+    return settle(input, messageId, 'blocked', null, `No transport is registered for ${input.channel}.`);
+  }
+
+  let result: ProviderResult;
+  try {
+    result = await transport(input, integration.config, getSecrets(input.orgId, provider));
+  } catch (err) {
+    result = {
+      ok: false, retryable: true,
+      error: `Could not reach the ${input.channel} provider: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  if (result.ok) {
+    if (input.channel === 'email') bumpUsage(input.orgId, 'emails_sent');
+    return settle(input, messageId, 'sent', result.providerMessageId ?? null, null);
+  }
+  // A permanent rejection is recorded as failed and never retried; a transient
+  // one stays retryable until MAX_SEND_ATTEMPTS.
+  if (input.channel === 'email' && result.retryable === false) {
+    run('UPDATE integrations SET status = ?, last_error = ?, last_checked_at = ? WHERE org_id = ? AND provider = ?', [
+      'error', result.error ?? 'The mail server rejected the message.', nowIso(), input.orgId, 'smtp',
+    ]);
+  }
+  return settle(input, messageId, 'failed', null, result.error ?? 'The provider rejected the message.',
+    result.retryable !== false);
 }
 
-async function sendEmail(input: SendMessageInput, messageId: string): Promise<SendResult> {
-  const integration = getIntegration(input.orgId, 'smtp');
-  if (!integration || integration.status !== 'connected') {
-    const reason = 'Email is not connected. Connect your mailbox in Settings → Communication to send from VoltaFlow.';
-    recordMessage(input, messageId, 'blocked', null, reason);
-    return { sent: false, messageId, reason };
+interface Claim { messageId: string; replay?: SendResult }
+
+/**
+ * Reserves a row for this send. With a dedupe key the reservation is unique, so
+ * the second caller gets the first one's outcome back:
+ *   sent    → never send again
+ *   blocked → a rule refused it (opt-out, no provider); retrying cannot help
+ *   failed  → transient, so retry until the attempt cap
+ */
+function claimMessage(input: SendMessageInput): Claim {
+  const key = input.dedupeKey ?? null;
+  if (key) {
+    const existing = get<any>('SELECT * FROM messages WHERE org_id = ? AND dedupe_key = ?', [input.orgId, key]);
+    if (existing) {
+      if (existing.status === 'sent') {
+        return {
+          messageId: existing.id,
+          replay: { sent: true, messageId: existing.id, providerMessageId: existing.provider_message_id ?? undefined },
+        };
+      }
+      if (existing.status === 'blocked' || existing.attempts >= MAX_SEND_ATTEMPTS) {
+        return {
+          messageId: existing.id,
+          replay: {
+            sent: false, messageId: existing.id,
+            reason: existing.status === 'blocked'
+              ? existing.error
+              : `${existing.error} (gave up after ${existing.attempts} attempts)`,
+          },
+        };
+      }
+      // Transient failure, still under the cap: try again on the same row.
+      run('UPDATE messages SET attempts = attempts + 1 WHERE id = ?', [existing.id]);
+      return { messageId: existing.id };
+    }
   }
-  const secrets = getSecrets(input.orgId, 'smtp');
+
+  const messageId = newId('msg');
+  try {
+    insert('messages', {
+      id: messageId,
+      org_id: input.orgId,
+      lead_id: input.leadId ?? null,
+      customer_id: input.customerId ?? null,
+      quotation_id: input.quotationId ?? null,
+      channel: input.channel,
+      direction: 'outbound',
+      to_address: input.to,
+      subject: input.subject ?? null,
+      body: input.body,
+      purpose: input.purpose ?? 'operational',
+      status: 'queued',
+      provider: input.channel === 'email' ? 'smtp' : input.channel,
+      user_id: input.userId ?? null,
+      automation_run_id: input.automationRunId ?? null,
+      dedupe_key: key,
+      attempts: 1,
+      created_at: nowIso(),
+    });
+  } catch {
+    // Another execution claimed the same key between the read and the insert.
+    const existing = get<any>('SELECT * FROM messages WHERE org_id = ? AND dedupe_key = ?', [input.orgId, key]);
+    return {
+      messageId: existing?.id ?? messageId,
+      replay: {
+        sent: existing?.status === 'sent',
+        messageId: existing?.id ?? messageId,
+        reason: existing?.status === 'sent' ? undefined : 'This message is already being sent.',
+      },
+    };
+  }
+  return { messageId };
+}
+
+/** Writes the outcome to the claimed row and puts it on the lead timeline. */
+function settle(
+  input: SendMessageInput, messageId: string, status: 'sent' | 'failed' | 'blocked',
+  providerMessageId: string | null, error: string | null, retryable = false,
+): SendResult {
+  run(
+    `UPDATE messages SET status = ?, provider_message_id = ?, error = ?, sent_at = ? WHERE id = ?`,
+    [status, providerMessageId, error, status === 'sent' ? nowIso() : null, messageId],
+  );
+  // A transient failure keeps its key claimable so the next attempt reuses this
+  // row; a permanent one does not, and neither does a success.
+  if (status === 'failed' && !retryable) {
+    run('UPDATE messages SET attempts = ? WHERE id = ?', [MAX_SEND_ATTEMPTS, messageId]);
+  }
+  logSendToTimeline(input, messageId, status, error);
+  return status === 'sent'
+    ? { sent: true, messageId, providerMessageId: providerMessageId ?? undefined }
+    : { sent: false, messageId, reason: error ?? 'The message could not be sent.' };
+}
+
+/** SMTP. Registered as the email transport; substituted in tests. */
+const smtpTransport: ProviderTransport = async (input, config, secrets) => {
   try {
     const transport = nodemailer.createTransport({
-      host: integration.config.host,
-      port: Number(integration.config.port ?? 587),
-      secure: Boolean(integration.config.secure),
+      host: config.host,
+      port: Number(config.port ?? 587),
+      secure: Boolean(config.secure),
       auth: secrets.user ? { user: secrets.user, pass: secrets.pass } : undefined,
     });
     const info = await transport.sendMail({
-      from: integration.config.from_address
-        ? `${integration.config.from_name ?? ''} <${integration.config.from_address}>`.trim()
+      from: config.from_address
+        ? `${config.from_name ?? ''} <${config.from_address}>`.trim()
         : secrets.user,
       to: input.to,
       subject: input.subject ?? '(no subject)',
       text: input.body,
       attachments: input.attachments,
     });
-    recordMessage(input, messageId, 'sent', info.messageId ?? null, null);
-    bumpUsage(input.orgId, 'emails_sent');
-    return { sent: true, messageId, providerMessageId: info.messageId };
+    return { ok: true, providerMessageId: info.messageId ?? null };
   } catch (err) {
-    const reason = `The mail server rejected the message: ${err instanceof Error ? err.message : String(err)}`;
-    recordMessage(input, messageId, 'failed', null, reason);
-    run('UPDATE integrations SET status = ?, last_error = ?, last_checked_at = ? WHERE org_id = ? AND provider = ?', [
-      'error', reason, nowIso(), input.orgId, 'smtp',
-    ]);
-    return { sent: false, messageId, reason };
+    const message = err instanceof Error ? err.message : String(err);
+    // A rejected recipient or a refused login will not fix itself; a timeout or
+    // a dropped connection might.
+    const permanent = /5\d\d|invalid|no recipients|authentication|auth/i.test(message);
+    return { ok: false, error: `The mail server rejected the message: ${message}`, retryable: !permanent };
   }
-}
+};
 
 /**
  * WhatsApp Business Cloud API. The request shape is implemented in full; until a
- * phone number id and token are saved in Settings the call is refused rather than
- * faked.
+ * phone number id and token are saved in Settings the send is refused rather
+ * than faked.
  */
-async function sendWhatsApp(input: SendMessageInput, messageId: string): Promise<SendResult> {
-  const integration = getIntegration(input.orgId, 'whatsapp_cloud');
-  if (!integration || integration.status !== 'connected') {
-    const reason = 'WhatsApp is not connected. Connect WhatsApp Business in Settings → Communication to enable this feature.';
-    recordMessage(input, messageId, 'blocked', null, reason);
-    return { sent: false, messageId, reason };
-  }
-  const secrets = getSecrets(input.orgId, 'whatsapp_cloud');
-  const phoneNumberId = integration.config.phone_number_id;
-  if (!phoneNumberId || !secrets.access_token) {
-    const reason = 'WhatsApp is missing its phone number id or access token.';
-    recordMessage(input, messageId, 'blocked', null, reason);
-    return { sent: false, messageId, reason };
+const whatsAppTransport: ProviderTransport = async (input, config, secrets) => {
+  if (!config.phone_number_id || !secrets.access_token) {
+    return { ok: false, error: 'WhatsApp is missing its phone number id or access token.', retryable: false };
   }
   try {
-    const response = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+    const response = await fetch(`https://graph.facebook.com/v21.0/${config.phone_number_id}/messages`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${secrets.access_token}`,
@@ -159,60 +308,57 @@ async function sendWhatsApp(input: SendMessageInput, messageId: string): Promise
     });
     const payload = (await response.json()) as any;
     if (!response.ok) {
-      const reason = payload?.error?.message ?? `WhatsApp returned HTTP ${response.status}`;
-      recordMessage(input, messageId, 'failed', null, reason);
-      return { sent: false, messageId, reason };
+      return {
+        ok: false,
+        error: payload?.error?.message ?? `WhatsApp returned HTTP ${response.status}`,
+        // 4xx is our mistake and will repeat; 5xx and rate limits are worth another go.
+        retryable: response.status >= 500 || response.status === 429,
+      };
     }
-    const providerId = payload?.messages?.[0]?.id ?? null;
-    recordMessage(input, messageId, 'sent', providerId, null);
-    return { sent: true, messageId, providerMessageId: providerId ?? undefined };
+    return { ok: true, providerMessageId: payload?.messages?.[0]?.id ?? null };
   } catch (err) {
-    const reason = `Could not reach WhatsApp: ${err instanceof Error ? err.message : String(err)}`;
-    recordMessage(input, messageId, 'failed', null, reason);
-    return { sent: false, messageId, reason };
+    return {
+      ok: false,
+      error: `Could not reach WhatsApp: ${err instanceof Error ? err.message : String(err)}`,
+      retryable: true,
+    };
   }
-}
+};
 
-function recordMessage(
-  input: SendMessageInput, messageId: string, status: string, providerMessageId: string | null, error: string | null,
+resetTransports();
+
+/**
+ * Puts the attempt on the lead timeline. A message that did not go out says so
+ * in as many words, and carries the reason and the run that produced it, so the
+ * history never implies a delivery that did not happen.
+ */
+function logSendToTimeline(
+  input: SendMessageInput, messageId: string, status: string, error: string | null,
 ): void {
-  insert('messages', {
-    id: messageId,
-    org_id: input.orgId,
-    lead_id: input.leadId ?? null,
-    customer_id: input.customerId ?? null,
-    quotation_id: input.quotationId ?? null,
-    channel: input.channel,
+  if (!input.leadId) return;
+  const automated = Boolean(input.automationRunId);
+  const what = `${channelLabel(input.channel)}${automated ? ' (automated)' : ''}`;
+  const subject = input.subject ?? truncate(input.body);
+  logActivity({
+    orgId: input.orgId,
+    leadId: input.leadId,
+    quotationId: input.quotationId ?? null,
+    type: input.channel,
     direction: 'outbound',
-    to_address: input.to,
-    subject: input.subject ?? null,
-    body: input.body,
-    purpose: input.purpose ?? 'operational',
-    status,
-    provider: input.channel === 'email' ? 'smtp' : input.channel,
-    provider_message_id: providerMessageId,
-    error,
-    sent_at: status === 'sent' ? nowIso() : null,
-    user_id: input.userId ?? null,
-    automation_run_id: input.automationRunId ?? null,
-    created_at: nowIso(),
+    title: status === 'sent'
+      ? `${what} sent: ${subject}`
+      : `${what} NOT sent: ${subject}`,
+    body: status === 'sent' ? input.body : `${error}\n\n---\n${input.body}`,
+    meta: {
+      message_id: messageId,
+      status,
+      automation_run_id: input.automationRunId ?? null,
+      dedupe_key: input.dedupeKey ?? null,
+      reason: error,
+    },
+    userId: input.userId ?? null,
+    isCustomerTouch: status === 'sent',
   });
-  if (input.leadId) {
-    logActivity({
-      orgId: input.orgId,
-      leadId: input.leadId,
-      quotationId: input.quotationId ?? null,
-      type: input.channel,
-      direction: 'outbound',
-      title: status === 'sent'
-        ? `${channelLabel(input.channel)} sent: ${input.subject ?? truncate(input.body)}`
-        : `${channelLabel(input.channel)} NOT sent: ${input.subject ?? truncate(input.body)}`,
-      body: status === 'sent' ? input.body : `${error}\n\n---\n${input.body}`,
-      meta: { message_id: messageId, status },
-      userId: input.userId ?? null,
-      isCustomerTouch: status === 'sent',
-    });
-  }
 }
 
 function channelLabel(channel: Channel): string {
@@ -257,7 +403,9 @@ export function channelStatus(orgId: string): Record<Channel, { connected: boole
   return {
     email: {
       connected: smtp?.status === 'connected',
-      reason: 'Connect your mailbox in Settings → Communication to send email from VoltaFlow.',
+      // The state comes first: whoever reads this needs to know nothing was sent
+      // before they need to know how to fix it.
+      reason: 'Email is not connected. Connect your mailbox in Settings → Communication to send from VoltaFlow.',
     },
     whatsapp: {
       connected: whatsapp?.status === 'connected',
@@ -370,6 +518,8 @@ export interface SendTemplateInput {
   /** Overrides the rendered body/subject, e.g. after the sender edited them. */
   bodyOverride?: string | null;
   subjectOverride?: string | null;
+  /** Identity of the scheduled action — see SendMessageInput.dedupeKey. */
+  dedupeKey?: string | null;
 }
 
 /** The rendered text of a template for one lead, for preview and editing. */
@@ -453,6 +603,20 @@ export async function sendTemplate(input: SendTemplateInput): Promise<SendResult
   }
 
   const ctx = templateContext(input.orgId, input);
+  const bodyCheck = renderChecked(template.body, ctx);
+  const subjectCheck = template.subject ? renderChecked(template.subject, ctx) : { text: null, missing: [] as string[] };
+
+  // An automated send with holes in it is worse than no send: refuse, say which
+  // fields are missing, and leave the problem visible. A person composing by
+  // hand sees the same text and can fix it themselves, so they are not blocked.
+  const missing = [...new Set([...bodyCheck.missing, ...subjectCheck.missing])];
+  if (input.automationRunId && missing.length > 0 && !input.bodyOverride) {
+    return {
+      sent: false, messageId: '',
+      reason: `Template "${input.templateKey}" is missing ${missing.join(', ')} for this lead, so nothing was sent.`,
+    };
+  }
+
   return sendMessage({
     orgId: input.orgId,
     channel: resolved.channel,
@@ -460,12 +624,13 @@ export async function sendTemplate(input: SendTemplateInput): Promise<SendResult
     customerId: input.customerId ?? null,
     quotationId: input.quotationId ?? null,
     to: resolved.to,
-    subject: input.subjectOverride ?? (template.subject ? render(template.subject, ctx) : null),
-    body: input.bodyOverride ?? render(template.body, ctx),
+    subject: input.subjectOverride ?? subjectCheck.text,
+    body: input.bodyOverride ?? bodyCheck.text,
     purpose: (input.purpose ?? template.purpose) as 'operational' | 'marketing',
     userId: input.userId ?? null,
     automationRunId: input.automationRunId ?? null,
     attachments: input.attachments,
+    dedupeKey: input.dedupeKey ?? null,
   });
 }
 

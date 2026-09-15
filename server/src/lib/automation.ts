@@ -208,7 +208,10 @@ export function executeDueSteps(runId: string): void {
       return;
     }
     if (ctx.lead?.automation_paused) {
-      finishRun(runId, 'stopped', 'paused');
+      // Paused, not finished: the run keeps its place and resumes where it was.
+      run('UPDATE automation_runs SET paused_at = COALESCE(paused_at, ?), next_run_at = NULL WHERE id = ?', [
+        nowIso(), runId,
+      ]);
       return;
     }
     if (step.stop_if && shouldStop(step.stop_if, ctx)) {
@@ -416,6 +419,11 @@ function runAction(action: AutomationAction, ctx: ActionContext, rule: RuleRow, 
         return `template "${action.template_key}" not sent: ${resolved.reason}`;
       }
       const channel = resolved.channel;
+      // The identity of THIS scheduled action: run, step, and which template.
+      // Deterministic, so a retry, a duplicated tick or a restart mid-send lands
+      // on the same claim and cannot message the customer twice — while a
+      // genuinely different step keeps its own key and still sends.
+      const dedupeKey = `${runRow.id}:${runRow.step_index}:send:${action.template_key}`;
       // Delivery is asynchronous; the real outcome is appended to this run's log
       // when the provider answers, so the log never claims an unconfirmed send.
       void sendTemplate({
@@ -428,6 +436,7 @@ function runAction(action: AutomationAction, ctx: ActionContext, rule: RuleRow, 
         userId: null,
         automationRunId: runRow.id,
         purpose: action.purpose ?? 'operational',
+        dedupeKey,
       }).then((result) => {
         appendRunLog(
           runRow.id,
@@ -554,6 +563,52 @@ export function stopRun(orgId: string, runId: string, reason: string): boolean {
   if (!row || row.status !== 'active') return false;
   finishRun(row.id, 'stopped', reason);
   return true;
+}
+
+/**
+ * Pauses one sequence without losing where it had got to. Clearing next_run_at
+ * is what takes it out of the scheduler's reach; paused_at remembers when, so
+ * resuming can give back the delay that was left rather than firing everything
+ * that came due in the meantime.
+ */
+export function pauseRun(orgId: string, runId: string): boolean {
+  const row = get<{ id: string; status: string; paused_at: string | null }>(
+    'SELECT id, status, paused_at FROM automation_runs WHERE id = ? AND org_id = ?', [runId, orgId],
+  );
+  if (!row || row.status !== 'active' || row.paused_at) return false;
+  run('UPDATE automation_runs SET paused_at = ?, next_run_at = NULL WHERE id = ?', [nowIso(), row.id]);
+  return true;
+}
+
+/** Resumes a paused sequence, shifting what was left of the wait forward. */
+export function resumeRun(orgId: string, runId: string): boolean {
+  const row = get<any>('SELECT * FROM automation_runs WHERE id = ? AND org_id = ?', [runId, orgId]);
+  if (!row || row.status !== 'active' || !row.paused_at) return false;
+  const rule = get<RuleRow>('SELECT * FROM automation_rules WHERE id = ?', [row.rule_id]);
+  const steps = rule ? parseJson<AutomationStep[]>(rule.steps, []) : [];
+  const nextStep = steps[row.step_index];
+  // Give back whatever delay the next step still had when it was paused. If it
+  // was already due, it runs on the next tick.
+  const remaining = nextStep ? Math.max(0, Number(nextStep.delay_minutes ?? 0)) : 0;
+  const pausedMinutes = Math.floor((Date.now() - new Date(row.paused_at).getTime()) / 60_000);
+  run('UPDATE automation_runs SET paused_at = NULL, next_run_at = ? WHERE id = ?', [
+    addMinutes(new Date(), Math.max(0, remaining - pausedMinutes)), row.id,
+  ]);
+  return true;
+}
+
+/** Pauses or resumes every sequence on a lead. */
+export function setLeadSequencesPaused(orgId: string, leadId: string, paused: boolean): number {
+  const runs = all<{ id: string }>(
+    `SELECT id FROM automation_runs WHERE org_id = ? AND lead_id = ? AND status = 'active'
+       AND paused_at IS ${paused ? 'NULL' : 'NOT NULL'}`,
+    [orgId, leadId],
+  );
+  let changed = 0;
+  for (const r of runs) {
+    if (paused ? pauseRun(orgId, r.id) : resumeRun(orgId, r.id)) changed += 1;
+  }
+  return changed;
 }
 
 function markContacted(orgId: string, leadId: string): void {
